@@ -1,7 +1,7 @@
 bl_info = {
     "name": "krutart linked action localizer",
     "author": "iorisek",
-    "version": (1, 2),
+    "version": (1, 3),  # Bumped version to 1.3
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Localize Actions",
     "description": "Converts linked actions to local copies for selected objects",
@@ -44,8 +44,44 @@ class OBJECT_OT_make_actions_local(bpy.types.Operator):
                 objects_processed += 1
                 actions_localized += nla_actions
 
+            data_processed, data_actions = self.process_data_animation(obj, processed_actions)
+            if data_processed:
+                objects_processed += 1
+                actions_localized += data_actions
+
         self.report({'INFO'}, f"Localized {actions_localized} actions on {objects_processed} objects")
         return {'FINISHED'}
+
+    def process_data_animation(self, obj, processed_actions):
+        if not obj.data:
+            return False, 0
+
+        data_block = obj.data
+        if not hasattr(data_block, 'animation_data') or not data_block.animation_data:
+            return False, 0
+
+        changed = False
+        action_count = 0
+
+        # Process direct action
+        if data_block.animation_data.action:
+            action = data_block.animation_data.action
+            if action.library and action not in processed_actions:
+                self.make_action_local(data_block, action, processed_actions)
+                changed = True
+                action_count += 1
+
+        # Process NLA strips
+        if data_block.animation_data.nla_tracks:
+            for track in data_block.animation_data.nla_tracks:
+                for strip in track.strips:
+                    if strip.type == 'CLIP' and strip.action and strip.action.library:
+                        if strip.action not in processed_actions:
+                            self.make_action_local(data_block, strip.action, processed_actions)
+                            changed = True
+                            action_count += 1
+
+        return changed, action_count
 
     def process_animation_data(self, obj, processed_actions):
         if not obj.animation_data or not obj.animation_data.action:
@@ -89,18 +125,18 @@ class OBJECT_OT_make_actions_local(bpy.types.Operator):
         new_action = action.copy()
         new_action.name = f"{action.name}_Local"
         new_action.use_fake_user = False
-        
+
         # Replace references to the original action
         if hasattr(owner, 'animation_data') and owner.animation_data:
             if owner.animation_data.action == action:
                 owner.animation_data.action = new_action
-            
+
             # Update NLA strips
             for track in owner.animation_data.nla_tracks:
                 for strip in track.strips:
                     if strip.action == action:
                         strip.action = new_action
-        
+
         processed_actions.add(action)
 
 # New panel class for the sidebar
