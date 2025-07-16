@@ -1,7 +1,7 @@
 bl_info = {
-    "name": "krutart linked action localizer",
+    "name": "krutart make linked actions local",
     "author": "iorisek",
-    "version": (1, 3),  # Bumped version to 1.3
+    "version": (1, 3),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Localize Actions",
     "description": "Converts linked actions to local copies for selected objects",
