@@ -1,6 +1,6 @@
 bl_info = {
     "name": "Timecode Burn-in",
-    "author": "Your Name Here",
+    "author": "iori",
     "version": (1, 0),
     "blender": (4, 4, 0),
     "location": "Output Properties > Output",
