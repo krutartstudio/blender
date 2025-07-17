@@ -15,6 +15,15 @@ def update_timecode_burnin(self, context):
 
     if context.scene.use_timecode_burnin:
         # Enable stamp with predefined settings
+        bpy.context.scene.render.use_stamp_date = False
+        bpy.context.scene.render.use_stamp_render_time = False
+        bpy.context.scene.render.use_stamp_frame = False
+        bpy.context.scene.render.use_stamp_memory = False
+        bpy.context.scene.render.use_stamp_hostname = False
+        bpy.context.scene.render.use_stamp_lens = False
+        bpy.context.scene.render.use_stamp_filename = False
+        bpy.context.scene.render.use_stamp_sequencer_strip = False
+        bpy.context.scene.render.use_stamp_marker = True
         render.use_stamp = True
         render.use_stamp_time = True
         render.use_stamp_frame_range = True
@@ -34,7 +43,7 @@ class RENDER_PT_timecode_burnin(bpy.types.Panel):
     bl_region_type = 'WINDOW'
     bl_context = "output"
     bl_options = {'DEFAULT_CLOSED'}
-    bl_order = 100  # Place at bottom of output properties
+    bl_order = 100
 
     def draw(self, context):
         layout = self.layout
