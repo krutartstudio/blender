@@ -14,7 +14,6 @@ def update_timecode_burnin(self, context):
     render = context.scene.render
 
     if context.scene.use_timecode_burnin:
-        # Enable stamp with predefined settings
         bpy.context.scene.render.use_stamp_date = False
         bpy.context.scene.render.use_stamp_render_time = False
         bpy.context.scene.render.use_stamp_frame = False
