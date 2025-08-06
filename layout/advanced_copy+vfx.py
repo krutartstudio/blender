@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Advanced Copy V4",
     "author": "iori, krutart, Gemini",
-    "version": (4, 0, 0),
+    "version": (4, 0, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Object Context Menu",
     "description": "Automatically performs MODEL or VFX copy/move operations based on object context and a structured collection hierarchy.",
