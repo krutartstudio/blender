@@ -1,229 +1,274 @@
+# Blender Addon: Timecode Burn-in Crop
+#
+# This addon adds tools to the Video Sequence Editor (VSE) to quickly
+# isolate a timecode burn-in area from a video strip and render it.
+#
+# Author: Gemini
+# Blender: 4.x
+# Version: 1.7
+#
+# Changelog:
+# v1.7: Fixed AttributeError by using 'offset_x'/'offset_y' instead of 'translation_x'/'translation_y' for Blender 4.x transform strips.
+# v1.6: Fixed render operator to ensure it renders the VSE output, not the 3D scene.
+# v1.5: Added "Render Cropped Clip" operator to render the selection.
+#       Fixed bug in "Crop to Burn-in" where it used hardcoded crop values.
+# v1.4: Fixed TypeError by using integer pixel values for .crop properties instead of floats.
+# v1.3: Corrected crop property access for Blender 4.x.
+# v1.1: Fixed TypeError by updating 'seq1' to 'input1' for Blender 4.x API compatibility.
+#
+# Instructions:
+# 1. Save this script as a Python file (e.g., "vse_crop_tools.py").
+# 2. In Blender, go to Edit > Preferences > Add-ons.
+# 3. Click "Install..." and select the saved Python file.
+# 4. Enable the addon by checking the box next to "VSE: Timecode Burn-in Crop".
+# 5. In the Video Sequence Editor, select a video strip.
+# 6. Open the Sidebar (press 'N' if it's hidden).
+# 7. Go to the "Tool" tab. You will find a "Timecode Tools" panel.
+# 8. Click "Crop to Burn-in". This creates a new Transform effect strip.
+# 9. With the new "BurninCrop_..." strip selected, click "Render Cropped Clip".
+# 10. The render will save to a 'renders' subfolder where your .blend file is saved.
+
 bl_info = {
-    "name": "ProRes Timecode Encoder",
-    "author": "Your Name & AI Assistant",
-    "version": (1, 1, 0),
-    "blender": (4, 1, 0),
-    "location": "Properties > Output Properties > ProRes Timecode",
-    "description": "Automatically embeds scene start timecode into rendered ProRes MOV files using FFmpeg.",
-    "warning": "Requires FFmpeg to be installed. The addon will try to find it automatically.",
-    "doc_url": "https://ffmpeg.org/download.html",
-    "category": "Render",
+    "name": "VSE: Timecode Burn-in Crop",
+    "author": "Gemini",
+    "version": (1, 7),
+    "blender": (4, 0, 0),
+    "location": "Video Sequence Editor > Sidebar (N) > Tool > Timecode Tools",
+    "description": "Crops a video strip to a standard timecode burn-in area and renders it",
+    "warning": "",
+    "doc_url": "",
+    "category": "Sequencer",
 }
 
 import bpy
-import subprocess
-import sys
 import os
-import shutil
-from bpy.app.handlers import persistent
-
-# --- Helper Functions ---
-
-def find_ffmpeg_path():
-    """
-    Tries to find the FFmpeg executable automatically.
-    Checks addon preferences first, then system PATH.
-    """
-    # 1. Check for a manually set path in preferences first.
-    prefs = bpy.context.preferences.addons[__name__].preferences
-    if prefs.ffmpeg_path and is_path_executable(prefs.ffmpeg_path):
-        return prefs.ffmpeg_path
-
-    # 2. If no manual path, search for 'ffmpeg' in the system's PATH environment variable.
-    # shutil.which() is the recommended, cross-platform way to do this.
-    ffmpeg_executable = shutil.which("ffmpeg")
-    if ffmpeg_executable:
-        return ffmpeg_executable
-
-    # 3. If not found, return None.
-    return None
-
-def is_path_executable(path):
-    """Checks if a given path points to an executable file."""
-    if not path or not os.path.isfile(path):
-        return False
-    if os.name == 'nt': # On Windows, just checking for the file is usually enough.
-        return True
-    # On POSIX systems (Linux, macOS), check for the execute permission bit.
-    return os.access(path, os.X_OK)
 
 
-def frames_to_timecode(frames, fps, fps_base=1.0):
-    """Converts a frame number to a SMPTE timecode string (HH:MM:SS:FF)."""
-    effective_fps = fps / fps_base
-    frames = int(frames)
-    
-    # Standard SMPTE calculation
-    # Drop-frame timecode is complex and only applies to specific frame rates (like 29.97).
-    # This calculation is for non-drop-frame timecode, which is most common.
-    total_seconds = frames / effective_fps
-    ss = int(total_seconds) % 60
-    mm = int(total_seconds / 60) % 60
-    hh = int(total_seconds / 3600)
-    ff = frames % round(effective_fps)
+# --- Main Operator ---
+# This class contains the core logic that runs when the "Crop" button is pressed.
+class SEQUENCER_OT_burnin_crop(bpy.types.Operator):
+    """Applies a crop effect to the selected strip to isolate the timecode burn-in"""
 
-    return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
+    bl_idname = "sequencer.burnin_crop"
+    bl_label = "Crop to Burn-in"
+    bl_options = {"REGISTER", "UNDO"}
 
-# --- Core Logic ---
-
-@persistent
-def embed_timecode_handler(scene):
-    """
-    This function is called by the 'render_post' handler after a render completes.
-    It checks settings and runs FFmpeg to embed the timecode.
-    """
-    if not scene.prores_timecode_props.enabled:
-        print("ProRes Timecode: Feature disabled, skipping.")
-        return
-
-    ffmpeg_path = find_ffmpeg_path()
-    if not ffmpeg_path:
-        print("ProRes Timecode Error: FFmpeg executable not found. Please install it and set the path in Addon Preferences.")
-        bpy.context.window_manager.popup_menu(
-            lambda self, context: self.layout.label(text="FFmpeg not found. Please configure it in Addon Preferences."),
-            title="ProRes Timecode Error",
-            icon='ERROR'
+    @classmethod
+    def poll(cls, context):
+        # This function checks if the operator can run.
+        # It requires an active scene with a sequence editor and an active strip.
+        return (
+            context.scene
+            and context.scene.sequence_editor
+            and context.scene.sequence_editor.active_strip
         )
-        return
 
-    image_settings = scene.render.image_settings
-    if image_settings.file_format != 'FFMPEG' or scene.render.ffmpeg.format != 'QUICKTIME':
-        print("ProRes Timecode: Output format is not QuickTime (.mov). Skipping.")
-        return
+    def execute(self, context):
+        # --- CONFIGURATION ---
+        # You can adjust the size of the crop rectangle here.
+        RECT_WIDTH = 164  # pixels
+        RECT_HEIGHT = 33  # pixels
+        TOP_MARGIN = 40  # pixels from the top of the frame
 
-    output_path = scene.render.frame_path(frame=scene.frame_current)
-    if not os.path.exists(output_path):
-        print(f"ProRes Timecode Error: Rendered file not found at {output_path}")
-        return
+        # Get the active context
+        editor = context.scene.sequence_editor
+        active_strip = editor.active_strip
 
-    start_frame = scene.frame_start
-    timecode_str = frames_to_timecode(start_frame, scene.render.fps, scene.render.fps_base)
-    print(f"ProRes Timecode: Calculated start timecode: {timecode_str} for frame {start_frame}")
+        # Check if the active strip is a valid type (not a sound or effect strip)
+        if active_strip.type not in {"MOVIE", "IMAGE", "SCENE", "CLIP", "META"}:
+            self.report(
+                {"WARNING"},
+                "Cannot apply effect to this strip type. Please select a video or image strip.",
+            )
+            return {"CANCELLED"}
 
-    path_parts = os.path.splitext(output_path)
-    temp_output_path = f"{path_parts[0]}_tc{path_parts[1]}"
+        # Get render dimensions
+        render_width = context.scene.render.resolution_x
+        render_height = context.scene.render.resolution_y
 
-    command = [
-        ffmpeg_path,
-        '-i', output_path,
-        '-c', 'copy',
-        '-timecode', timecode_str,
-        '-y',
-        temp_output_path
-    ]
+        # --- Calculate Crop Boundaries ---
+        # The Transform effect's crop values are integer pixel coordinates.
+        crop_left = (render_width - RECT_WIDTH) // 2
+        # Ensure total width is correct even with odd render dimensions
+        crop_right = render_width - RECT_WIDTH - crop_left
 
-    print(f"ProRes Timecode: Running FFmpeg command: {' '.join(command)}")
+        crop_top = TOP_MARGIN
+        crop_bottom = render_height - RECT_HEIGHT - crop_top
 
-    try:
-        startupinfo = None
-        if os.name == 'nt':
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        # --- Add and Configure the Effect Strip ---
+        # Add a new Transform effect strip on the channel above the active strip
+        transform_strip = editor.sequences.new_effect(
+            name=f"BurninCrop_{active_strip.name}",
+            type="TRANSFORM",
+            channel=active_strip.channel + 1,
+            frame_start=active_strip.frame_final_start,
+            frame_end=active_strip.frame_final_end,
+            input1=active_strip,
+        )
 
-        result = subprocess.run(command, check=True, capture_output=True, text=True, startupinfo=startupinfo)
-        print("ProRes Timecode: FFmpeg executed successfully.")
-        print("FFmpeg stdout:", result.stdout)
-        
-        os.remove(output_path)
-        os.rename(temp_output_path, output_path)
-        print(f"ProRes Timecode: Successfully created timecoded file at {output_path}")
+        if not transform_strip:
+            self.report({"ERROR"}, "Failed to create Transform effect strip.")
+            return {"CANCELLED"}
 
-    except FileNotFoundError:
-        print(f"ProRes Timecode Error: FFmpeg not found at '{ffmpeg_path}'.")
-    except subprocess.CalledProcessError as e:
-        print("ProRes Timecode Error: FFmpeg failed to execute.")
-        print("Return code:", e.returncode)
-        print("FFmpeg stderr:", e.stderr)
-        if os.path.exists(temp_output_path):
-            os.remove(temp_output_path)
-    except Exception as e:
-        print(f"ProRes Timecode Error: An unexpected error occurred: {e}")
-        if os.path.exists(temp_output_path):
-            os.remove(temp_output_path)
+        # Apply the calculated crop values
+        transform_strip.crop.min_x = crop_left
+        transform_strip.crop.max_x = crop_right
+        transform_strip.crop.min_y = crop_bottom
+        transform_strip.crop.max_y = crop_top
 
-# --- UI & Properties ---
+        # Deselect the original strip and select the new effect strip
+        active_strip.select = False
+        transform_strip.select = True
+        editor.active_strip = transform_strip
 
-class ProResTimecodeProperties(bpy.types.PropertyGroup):
-    enabled: bpy.props.BoolProperty(
-        name="Embed Timecode",
-        description="Enable to automatically embed scene start timecode into rendered ProRes files after rendering",
-        default=False,
-    )
+        self.report({"INFO"}, f"Applied burn-in crop to '{active_strip.name}'")
+        return {"FINISHED"}
 
-class ProResTimecodePanel(bpy.types.Panel):
-    bl_label = "ProRes Timecode"
-    bl_idname = "OUTPUT_PT_prores_timecode"
-    bl_space_type = 'PROPERTIES'
-    bl_region_type = 'WINDOW'
-    bl_context = "output"
+
+# --- Render Operator ---
+# This class handles rendering the cropped clip.
+class SEQUENCER_OT_render_cropped_clip(bpy.types.Operator):
+    """Renders the selected cropped clip to a new video file"""
+
+    bl_idname = "sequencer.render_cropped_clip"
+    bl_label = "Render Cropped Clip"
+    bl_options = {"REGISTER"}  # No UNDO for rendering operations
+
+    @classmethod
+    def poll(cls, context):
+        # Can only run if the active strip is a Transform effect created by this addon.
+        strip = context.scene.sequence_editor.active_strip
+        return (
+            strip and strip.type == "TRANSFORM" and strip.name.startswith("BurninCrop_")
+        )
+
+    def execute(self, context):
+        scene = context.scene
+        editor = scene.sequence_editor
+        active_strip = editor.active_strip
+
+        # --- Store Original Settings ---
+        # We store them so we can restore them after the render is done or cancelled.
+        original_settings = {
+            "filepath": scene.render.filepath,
+            "resolution_x": scene.render.resolution_x,
+            "resolution_y": scene.render.resolution_y,
+            "frame_start": scene.frame_start,
+            "frame_end": scene.frame_end,
+            "offset_x": active_strip.transform.offset_x,
+            "offset_y": active_strip.transform.offset_y,
+            "use_sequencer": scene.render.use_sequencer,
+        }
+
+        # --- Define Output Path ---
+        blend_file_path = bpy.data.filepath
+        if not blend_file_path:
+            self.report({"ERROR"}, "Please save the Blender file before rendering.")
+            return {"CANCELLED"}
+
+        # Create a 'renders' subdirectory in the same folder as the .blend file
+        render_dir = os.path.join(os.path.dirname(blend_file_path), "renders")
+        if not os.path.exists(render_dir):
+            os.makedirs(render_dir)
+
+        # Create a unique filename based on the original clip's name
+        original_clip_name = active_strip.name.replace("BurninCrop_", "")
+        output_filename = f"cropped_{original_clip_name}.mp4"
+        output_path = os.path.join(render_dir, output_filename)
+
+        # --- Calculate New Render Settings ---
+        crop = active_strip.crop
+        render_width = original_settings["resolution_x"]
+        render_height = original_settings["resolution_y"]
+
+        new_res_x = render_width - crop.min_x - crop.max_x
+        new_res_y = render_height - crop.min_y - crop.max_y
+
+        # Calculate the offset needed to center the cropped area
+        # in the new, smaller render frame.
+        new_offset_x = (crop.max_x - crop.min_x) / 2
+        new_offset_y = (crop.max_y - crop.min_y) / 2
+
+        try:
+            # --- Apply New Settings for Rendering ---
+            scene.render.filepath = output_path
+            scene.render.resolution_x = new_res_x
+            scene.render.resolution_y = new_res_y
+            scene.frame_start = active_strip.frame_final_start
+            scene.frame_end = active_strip.frame_final_end
+
+            # Ensure the render comes from the VSE, not the 3D scene
+            scene.render.use_sequencer = True
+
+            # Temporarily adjust the transform strip to center the content
+            active_strip.transform.offset_x = new_offset_x
+            active_strip.transform.offset_y = new_offset_y
+
+            # --- Render ---
+            # 'INVOKE_DEFAULT' shows the render progress window (non-blocking)
+            bpy.ops.render.render("INVOKE_DEFAULT", animation=True)
+
+        finally:
+            # --- Restore Original Settings ---
+            # This block runs even if the render is cancelled or fails,
+            # ensuring your scene settings are not permanently changed.
+            scene.render.filepath = original_settings["filepath"]
+            scene.render.resolution_x = original_settings["resolution_x"]
+            scene.render.resolution_y = original_settings["resolution_y"]
+            scene.frame_start = original_settings["frame_start"]
+            scene.frame_end = original_settings["frame_end"]
+            active_strip.transform.offset_x = original_settings["offset_x"]
+            active_strip.transform.offset_y = original_settings["offset_y"]
+            scene.render.use_sequencer = original_settings["use_sequencer"]
+
+        self.report({"INFO"}, f"Rendering started. Output: {output_path}")
+        return {"FINISHED"}
+
+
+# --- UI Panel ---
+# This class draws the panel in the VSE's sidebar.
+class SEQUENCER_PT_timecode_tools(bpy.types.Panel):
+    """Creates a Panel in the Sequencer's Tool properties window"""
+
+    bl_label = "Timecode Tools"
+    bl_idname = "SEQUENCER_PT_timecode_tools"
+    bl_space_type = "SEQUENCE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "Tool"
 
     def draw(self, context):
         layout = self.layout
-        props = context.scene.prores_timecode_props
-        layout.row().prop(props, "enabled")
+        col = layout.column(align=True)
 
-        ffmpeg_path = find_ffmpeg_path()
-        if not ffmpeg_path:
-            box = layout.box()
-            box.label(text="FFmpeg not found!", icon='ERROR')
-            box.label(text="Install it or set the path in Preferences.")
-        
-        image_settings = context.scene.render.image_settings
-        is_mov = image_settings.file_format == 'FFMPEG' and context.scene.render.ffmpeg.format == 'QUICKTIME'
-        if props.enabled and not is_mov:
-            box = layout.box()
-            box.label(text="Output format must be 'FFmpeg Video'", icon='WARNING')
-            box.label(text="with Container set to 'Quicktime' (.mov).")
+        # Draw a button that runs our crop operator
+        row_crop = col.row()
+        row_crop.scale_y = 1.5  # Make the button a bit taller
+        row_crop.operator(SEQUENCER_OT_burnin_crop.bl_idname)
 
-class ProResTimecodeAddonPreferences(bpy.types.AddonPreferences):
-    bl_idname = __name__
+        # Draw a button that runs our render operator
+        row_render = col.row()
+        row_render.scale_y = 1.5
+        row_render.operator(SEQUENCER_OT_render_cropped_clip.bl_idname)
 
-    ffmpeg_path: bpy.props.StringProperty(
-        name="FFmpeg Manual Path",
-        description="Manually set the path to the FFmpeg executable. Leave blank to auto-detect",
-        subtype='FILE_PATH',
-    )
-
-    def draw(self, context):
-        layout = self.layout
-        box = layout.box()
-        
-        ffmpeg_path = find_ffmpeg_path()
-        
-        if ffmpeg_path:
-            box.label(text="FFmpeg Detected:", icon='CHECKMARK')
-            box.label(text=ffmpeg_path)
-        else:
-            box.label(text="FFmpeg Not Found!", icon='ERROR')
-            box.label(text="Please install FFmpeg and ensure it's in your system's PATH.")
-            row = box.row()
-            row.operator("wm.url_open", text="Download FFmpeg").url = "https://ffmpeg.org/download.html"
-
-        layout.separator()
-        layout.label(text="You can manually override the path below if needed:")
-        layout.prop(self, "ffmpeg_path")
 
 # --- Registration ---
-
+# This is standard Blender addon code to register and unregister the classes.
 classes = (
-    ProResTimecodeProperties,
-    ProResTimecodePanel,
-    ProResTimecodeAddonPreferences,
+    SEQUENCER_OT_burnin_crop,
+    SEQUENCER_OT_render_cropped_clip,
+    SEQUENCER_PT_timecode_tools,
 )
+
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.prores_timecode_props = bpy.props.PointerProperty(type=ProResTimecodeProperties)
-    if embed_timecode_handler not in bpy.app.handlers.render_post:
-        bpy.app.handlers.render_post.append(embed_timecode_handler)
+
 
 def unregister():
-    if embed_timecode_handler in bpy.app.handlers.render_post:
-        bpy.app.handlers.render_post.remove(embed_timecode_handler)
-    del bpy.types.Scene.prores_timecode_props
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+
 
 if __name__ == "__main__":
     register()
