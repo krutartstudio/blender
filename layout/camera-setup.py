@@ -99,7 +99,8 @@ class SCENE_OT_setup_cameras_from_markers(bpy.types.Operator):
             return {"CANCELLED"}
 
         processed_markers = 0
-        for marker in markers:
+        camera_offset_counter = 0  # Counter for staggering camera rigs
+        for marker in sorted(markers, key=lambda m: m.frame):  # Sort markers by frame
             # Match marker names like 'CAM-SC17-SH001-FLAT'
             match = re.match(r"CAM-(SC\d+)-(SH\d+)-FLAT", marker.name, re.IGNORECASE)
             if not match:
@@ -111,14 +112,22 @@ class SCENE_OT_setup_cameras_from_markers(bpy.types.Operator):
             sc_id, sh_id = match.groups()
             sc_id_upper = sc_id.upper()
             sh_id_upper = sh_id.upper()
-            cam_collection_name = f"CAM-{sc_id_upper}-{sh_id_upper}"
 
-            # --- Check if the camera collection already exists in the target parent ---
-            if cam_collection_name in shot_ani_collection.children:
+            # Define names for the new collections
+            cam_collection_name = f"CAM-{sc_id_upper}-{sh_id_upper}"
+            wrapper_collection_name = f"{sc_id_upper}-{sh_id_upper}-ANI"
+
+            # --- Check if the wrapper collection already exists ---
+            if wrapper_collection_name in shot_ani_collection.children:
                 log.info(
-                    f"Collection '{cam_collection_name}' already exists in '{shot_ani_collection.name}'. Skipping."
+                    f"Wrapper collection '{wrapper_collection_name}' already exists in '{shot_ani_collection.name}'. Skipping."
                 )
                 continue
+
+            # --- Create the main wrapper collection for this shot ---
+            wrapper_collection = bpy.data.collections.new(wrapper_collection_name)
+            shot_ani_collection.children.link(wrapper_collection)
+            log.info(f"Created wrapper collection '{wrapper_collection_name}'.")
 
             # --- Append the Camera Rig ---
             try:
@@ -134,13 +143,15 @@ class SCENE_OT_setup_cameras_from_markers(bpy.types.Operator):
                     msg = f"Could not find collection '{COLLECTION_TO_APPEND}' in '{camera_hero_blend_path}'."
                     log.error(msg)
                     self.report({"ERROR"}, msg)
+                    # Clean up the created wrapper collection on failure
+                    bpy.data.collections.remove(wrapper_collection)
                     continue
 
                 appended_collection = data_to.collections[0]
 
-                # --- Rename and Link the main collection ---
+                # --- Rename and Link the main appended collection into its wrapper ---
                 appended_collection.name = cam_collection_name
-                shot_ani_collection.children.link(appended_collection)
+                wrapper_collection.children.link(appended_collection)
 
                 # --- Set Collection Color ---
                 appended_collection.color_tag = "COLOR_05"  # Purple
@@ -174,9 +185,24 @@ class SCENE_OT_setup_cameras_from_markers(bpy.types.Operator):
 
                 cam_rig_collection = appended_collection.children.get("cam_rig")
                 if cam_rig_collection:
-                    new_name = f"{sc_id_upper}-{sh_id_upper}-cam_rig"
+                    # Rename the rig collection
+                    new_name = f"cam_rig-{sc_id_upper}-{sh_id_upper}"
                     cam_rig_collection.name = new_name
                     log.info(f"Renamed 'cam_rig' collection to '{new_name}'")
+
+                    # --- Move the entire rig collection by an offset ---
+                    x_offset = camera_offset_counter * 2.0
+                    if x_offset > 0:
+                        log.info(
+                            f"Applying X-axis offset of {x_offset}m to '{new_name}'."
+                        )
+                        # Move all objects within the rig collection
+                        for obj in cam_rig_collection.all_objects:
+                            obj.location.x += x_offset
+
+                    # Increment counter for the next camera
+                    camera_offset_counter += 1
+
                 else:
                     log.warning(
                         f"Could not find 'cam_rig' collection inside '{appended_collection.name}'"
@@ -196,6 +222,9 @@ class SCENE_OT_setup_cameras_from_markers(bpy.types.Operator):
                 msg = f"An error occurred while processing marker '{marker.name}': {e}"
                 log.error(msg, exc_info=True)
                 self.report({"ERROR"}, msg)
+                # Clean up the created wrapper collection on failure
+                if wrapper_collection.name in bpy.data.collections:
+                    bpy.data.collections.remove(wrapper_collection)
                 continue
 
         log.info(
