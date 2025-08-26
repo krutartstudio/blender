@@ -1,9 +1,9 @@
 bl_info = {
-    "name": "Project Layout & Camera Setup",
+    "name": "Layout Suite",
     "author": "IORI, Gemini, Krutart",
-    "version": (2, 1, 2),
-    "blender": (4, 5, 0),
-    "location": "Outliner > Context Menu, 3D View > Context Menu & Video Sequencer > UI Panel",
+    "version": (2, 3, 2),
+    "blender": (4, 1, 0),
+    "location": "3D View > UI > Layout Suite",
     "description": "A unified addon to initialize collection structures, import animatics, and set up cameras from timeline markers based on a specific studio pipeline.",
     "warning": "",
     "doc_url": "",
@@ -294,7 +294,7 @@ class SCENE_OT_verify_shot_collections(bpy.types.Operator):
 
 # --- Animatic and Camera Operators ---
 class SEQUENCER_OT_import_animatic_guides(bpy.types.Operator):
-    """Scans a directory for scene folders, creates Blender scenes, and imports animatic 'guide' videos."""
+    """Scans a directory for scene folders, creates Blender scenes, and imports animatic 'guide' videos with sound."""
 
     bl_idname = "sequencer.import_animatic_guides"
     bl_label = "Import/Update Animatic Guides"
@@ -311,6 +311,11 @@ class SEQUENCER_OT_import_animatic_guides(bpy.types.Operator):
         if not os.path.isdir(root_dir):
             self.report({"ERROR"}, "Invalid directory selected.")
             return {"CANCELLED"}
+
+        vse_area = next((area for area in context.screen.areas if area.type == 'SEQUENCE_EDITOR'), None)
+        if not vse_area:
+            self.report({'ERROR'}, "Operation requires a Video Sequence Editor to be open in the workspace.")
+            return {'CANCELLED'}
 
         try:
             scene_dirs = [
@@ -346,7 +351,7 @@ class SEQUENCER_OT_import_animatic_guides(bpy.types.Operator):
             guide_files = []
             for dirpath, _, filenames in os.walk(scene_path):
                 for f in filenames:
-                    if "-guide-" in f.lower() and f.lower().endswith(".mp4"):
+                    if "-guide-" in f.lower() and f.lower().endswith((".mp4", ".mov")):
                         guide_files.append(os.path.join(dirpath, f))
 
             if not guide_files:
@@ -357,9 +362,28 @@ class SEQUENCER_OT_import_animatic_guides(bpy.types.Operator):
                 continue
 
             guide_files.sort()
+            
+            # --- NEW: Clean up old guide strips for this scene before importing ---
+            strips_to_remove = []
+            for s in seq_editor.sequences_all:
+                path_to_check = None
+                if s.type == 'MOVIE':
+                    path_to_check = s.filepath
+                elif s.type == 'SOUND':
+                    path_to_check = s.sound.filepath
+
+                if path_to_check and path_to_check.startswith(scene_path) and "-guide-" in os.path.basename(path_to_check).lower():
+                    strips_to_remove.append(s)
+
+            if strips_to_remove:
+                log.info(f"Removing {len(strips_to_remove)} old guide strips from scene '{scene_name}'.")
+                for strip in strips_to_remove:
+                    if strip.name in seq_editor.sequences:
+                         seq_editor.sequences.remove(strip)
+            # --- END NEW CODE ---
+
 
             # --- Clean up old markers for this scene ---
-            # This prevents orphaned markers if shots are removed in the new version.
             sc_match = re.match(r"^(SC\d+)", scene_name, re.IGNORECASE)
             if sc_match:
                 current_sc_id = sc_match.group(1).upper()
@@ -376,28 +400,41 @@ class SEQUENCER_OT_import_animatic_guides(bpy.types.Operator):
                     for m in markers_to_remove:
                         blender_scene.timeline_markers.remove(m)
 
-            # --- Import to a new channel ---
-            max_channel = max((s.channel for s in seq_editor.sequences_all), default=0)
+            # --- Import to new channels ---
+            max_channel = 0
+            if seq_editor.sequences_all:
+                max_channel = max(s.channel for s in seq_editor.sequences_all)
+            
             target_channel = max_channel + 1
             self.report(
                 {"INFO"},
-                f"Importing guides for '{scene_name}' to new channel {target_channel}.",
+                f"Importing guides for '{scene_name}' to Video Channel {target_channel} and Sound Channel {target_channel + 1}.",
             )
 
             current_frame = 1
             for video_path in guide_files:
                 filename = os.path.basename(video_path)
-                new_strip = seq_editor.sequences.new_movie(
-                    name=filename,
-                    filepath=video_path,
-                    channel=target_channel,
-                    frame_start=current_frame,
-                )
 
-                if not new_strip:
-                    self.report(
-                        {"WARNING"}, f"Failed to import video strip from: {video_path}"
+                with context.temp_override(window=context.window, area=vse_area, scene=blender_scene):
+                    bpy.ops.sequencer.movie_strip_add(
+                        filepath=video_path,
+                        directory=os.path.dirname(video_path),
+                        files=[{"name": filename}],
+                        frame_start=current_frame,
+                        channel=target_channel,
+                        fit_method='FIT',
+                        adjust_playback_rate=True
                     )
+
+                new_video_strip = None
+                for s in reversed(seq_editor.sequences_all):
+                    if s.channel == target_channel and s.frame_start == current_frame:
+                        new_video_strip = s
+                        break
+                
+                if not new_video_strip:
+                    self.report({"WARNING"}, f"Failed to import or find video strip from: {video_path}")
+                    current_frame += 1 
                     continue
 
                 # Create new markers
@@ -418,7 +455,7 @@ class SEQUENCER_OT_import_animatic_guides(bpy.types.Operator):
                         f"Could not parse SC/SH from '{filename}'. Skipping marker creation.",
                     )
 
-                current_frame += new_strip.frame_final_duration
+                current_frame += new_video_strip.frame_final_duration
 
             blender_scene.frame_end = current_frame - 1
             log.info(f"Set scene '{scene_name}' end frame to {blender_scene.frame_end}")
@@ -536,18 +573,28 @@ class SCENE_OT_setup_cameras_from_markers(bpy.types.Operator):
                                     )
                     elif "cam_rig" in child_col.name:
                         child_col.name = f"cam_rig-{sc_id_upper}-{sh_id_upper}"
+
+                        # Find the specific rig object to move, rename it, and store a reference.
+                        rig_object_to_move = None
                         for obj in child_col.objects:
                             if obj.type == "ARMATURE" and obj.name.startswith(
                                 "+cam_rig"
                             ):
                                 obj.name = f"+cam_rig-{sc_id_upper}-{sh_id_upper}"
+                                rig_object_to_move = obj  # Store the object reference
                                 log.info(f"Renamed armature to '{obj.name}'.")
-                                break
+                                break  # Found it, no need to continue looping
 
+                        # Calculate the offset for this camera instance.
                         x_offset = camera_offset_counter * 2.0
-                        if x_offset > 0:
-                            for obj in child_col.all_objects:
-                                obj.location.x += x_offset
+
+                        # Apply the offset ONLY to the found rig object.
+                        if rig_object_to_move and x_offset > 0:
+                            rig_object_to_move.location.x += x_offset
+                            log.info(
+                                f"Moved '{rig_object_to_move.name}' by {x_offset} on the X-axis."
+                            )
+
                     elif "cam_boneshapes" in child_col.name:
                         child_col.name = f"__cam_boneshapes-{sc_id_upper}-{sh_id_upper}"
 
@@ -605,6 +652,19 @@ class SCENE_OT_bind_cameras_to_markers(bpy.types.Operator):
         cameras = [obj for obj in scene.objects if obj.type == "CAMERA"]
 
         log.info(f"--- Starting Camera Binding for '{self.camera_type}' cameras ---")
+
+        # --- NEW: Set render resolution based on camera type ---
+        if self.camera_type == "FLAT":
+            scene.render.resolution_x = 1920
+            scene.render.resolution_y = 1080
+            log.info("Set render resolution to 1920x1080 for FLAT cameras.")
+            self.report({"INFO"}, "Set resolution to 1920x1080 (FLAT).")
+        elif self.camera_type == "FULLDOME":
+            scene.render.resolution_x = 2048
+            scene.render.resolution_y = 2048
+            log.info("Set render resolution to 2048x2048 for FULLDOME cameras.")
+            self.report({"INFO"}, "Set resolution to 2048x2048 (FULLDOME).")
+        # --- END NEW CODE ---
 
         if not markers:
             msg = "No timeline markers found in the scene."
@@ -671,21 +731,6 @@ class SCENE_OT_bind_cameras_to_markers(bpy.types.Operator):
 
 
 # --- UI Panels and Menus ---
-class SEQUENCER_PT_animatic_tools(bpy.types.Panel):
-    """Adds a UI panel in the Video Sequencer's 'Tool' tab."""
-
-    bl_label = "Animatic Tools"
-    bl_space_type = "SEQUENCE_EDITOR"
-    bl_region_type = "UI"
-    bl_category = "Tool"
-
-    def draw(self, context):
-        layout = self.layout
-        layout.operator(
-            SEQUENCER_OT_import_animatic_guides.bl_idname,
-            text="Import/Update Guides",
-            icon="FILE_FOLDER",
-        )
 
 
 class SCENE_MT_bind_cameras_menu(bpy.types.Menu):
@@ -708,51 +753,60 @@ class SCENE_MT_bind_cameras_menu(bpy.types.Menu):
         op_fulldome.camera_type = "FULLDOME"
 
 
-class OUTLINER_MT_project_setup_menu(bpy.types.Menu):
-    """The main menu in the Outliner for all setup operations."""
+class VIEW3D_PT_layout_suite_main_panel(bpy.types.Panel):
+    """The main UI panel for the Layout Suite addon in the 3D View."""
 
-    bl_label = "Project Setup"
-    bl_idname = "OUTLINER_MT_project_setup_menu"
+    bl_label = "Layout Suite"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Layout Suite"  # This creates the tab in the N-panel
 
     def draw(self, context):
         layout = self.layout
-        scene_name = context.scene.name
+        scene = context.scene
+        scene_name = scene.name
 
-        # Show operators based on scene name prefix
+        # --- Scene Type Specific Tools ---
+        # Draw UI elements based on the current scene's name prefix.
+
         if re.match(r"^LOC-", scene_name, re.IGNORECASE):
-            layout.operator(SCENE_OT_create_location_structure.bl_idname)
+            box = layout.box()
+            box.label(text="Location Tools", icon="WORLD_DATA")
+            box.operator(SCENE_OT_create_location_structure.bl_idname)
 
-        if re.match(r"^ENV-", scene_name, re.IGNORECASE):
-            layout.operator(SCENE_OT_create_enviro_structure.bl_idname)
+        elif re.match(r"^ENV-", scene_name, re.IGNORECASE):
+            box = layout.box()
+            box.label(text="Environment Tools", icon="OUTLINER_OB_LIGHTPROBE")
+            box.operator(SCENE_OT_create_enviro_structure.bl_idname)
 
-        if re.match(r"^SC\d+-", scene_name, re.IGNORECASE):
-            layout.operator(SCENE_OT_create_scene_structure.bl_idname)
-            layout.separator()
-            layout.operator(
-                SCENE_OT_verify_shot_collections.bl_idname, icon="CHECKMARK"
+        elif re.match(r"^SC\d+-", scene_name, re.IGNORECASE):
+            # Main Scene Setup
+            box = layout.box()
+            box.label(text="Initial Scene Setup", icon="SCENE_DATA")
+            box.operator(SCENE_OT_create_scene_structure.bl_idname)
+
+            # Animatic and Timeline Tools
+            box = layout.box()
+            box.label(text="Animatic & Markers", icon="SEQUENCE")
+            box.operator(
+                SEQUENCER_OT_import_animatic_guides.bl_idname,
+                text="Import/Update Guides",
+                icon="FILE_FOLDER",
             )
-            layout.operator(
+            box.operator(SCENE_OT_verify_shot_collections.bl_idname, icon="CHECKMARK")
+
+            # Camera Tools
+            box = layout.box()
+            box.label(text="Camera Management", icon="CAMERA_DATA")
+            box.operator(
                 SCENE_OT_setup_cameras_from_markers.bl_idname, icon="CAMERA_DATA"
             )
-            # Add the new submenu for binding cameras
-            layout.separator()
-            layout.menu(SCENE_MT_bind_cameras_menu.bl_idname, icon="LINKED")
+            box.separator()
+            box.menu(SCENE_MT_bind_cameras_menu.bl_idname, icon="LINKED")
 
-
-def draw_menu_in_outliner(self, context):
-    """Appends the main menu to the Outliner's context menu if the scene name matches."""
-    scene_name = context.scene.name
-    if re.match(r"^(LOC-|ENV-|SC\d+-)", scene_name, re.IGNORECASE):
-        self.layout.separator()
-        self.layout.menu(OUTLINER_MT_project_setup_menu.bl_idname)
-
-
-def draw_bind_menu_in_3d_view(self, context):
-    """Appends the camera binding menu to the 3D View's context menu."""
-    scene_name = context.scene.name
-    if re.match(r"^SC\d+-", scene_name, re.IGNORECASE):
-        self.layout.separator()
-        self.layout.menu(SCENE_MT_bind_cameras_menu.bl_idname)
+        else:
+            layout.label(text="Scene name not recognized.")
+            layout.label(text="Use LOC-, ENV-, or SC##- prefix.")
 
 
 # --- Registration ---
@@ -765,9 +819,8 @@ classes = (
     SEQUENCER_OT_import_animatic_guides,
     SCENE_OT_setup_cameras_from_markers,
     SCENE_OT_bind_cameras_to_markers,
-    SEQUENCER_PT_animatic_tools,
     SCENE_MT_bind_cameras_menu,
-    OUTLINER_MT_project_setup_menu,
+    VIEW3D_PT_layout_suite_main_panel,
 )
 
 
@@ -775,30 +828,8 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
-    # Safely append menus to their respective UI locations
-    try:
-        bpy.types.OUTLINER_MT_context_menu.append(draw_menu_in_outliner)
-    except AttributeError:
-        log.warning("Outliner context menu not found, skipping menu registration.")
-
-    try:
-        bpy.types.VIEW3D_MT_context_menu.append(draw_bind_menu_in_3d_view)
-    except AttributeError:
-        log.warning("3D View context menu not found, skipping menu registration.")
-
 
 def unregister():
-    # Safely remove menus before unregistering classes
-    try:
-        bpy.types.VIEW3D_MT_context_menu.remove(draw_bind_menu_in_3d_view)
-    except AttributeError:
-        pass  # Menu was likely not registered, so we can ignore this.
-
-    try:
-        bpy.types.OUTLINER_MT_context_menu.remove(draw_menu_in_outliner)
-    except AttributeError:
-        pass  # Menu was likely not registered, so we can ignore this.
-
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
