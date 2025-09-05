@@ -52,13 +52,13 @@ class LayoutCameraAddonPreferences(AddonPreferences):
 # --- Constants ---
 # Color tags for collection organization
 COLLECTION_COLORS = {
-    "LOCATION": "COLOR_05",  # Blue
-    "ENVIRO": "COLOR_04",  # Green
-    "SCENE": "COLOR_01",  # Red
-    "ART": "COLOR_02",  # Yellow
-    "ANI": "COLOR_03",  # Orange
-    "VFX": "COLOR_06",  # Pink/Magenta
-    "CAMERA": "COLOR_07",  # Purple
+    "LOCATION": "COLOR_08",
+    "ENVIRO": "COLOR_02",
+    "SCENE": "COLOR_03",
+    "ART": "COLOR_05",
+    "ANI": "COLOR_01",
+    "VFX": "COLOR_04",
+    "CAMERA": "COLOR_06",
 }
 
 # Name of the camera collection to append from the hero file
