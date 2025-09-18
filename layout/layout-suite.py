@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Layout Suite",
-    "author": "IORI, Gemini, Krutart",
-    "version": (2, 8, 1),
+    "author": "IORI, Krutart, Gemini",
+    "version": (2, 8, 2),
     "blender": (4, 2, 0),
     "location": "3D View > UI > Layout Suite",
     "description": "A unified addon to initialize collection structures, import animatics, and set up cameras from timeline markers based on a specific studio pipeline.",
@@ -132,11 +132,11 @@ def get_or_create_collection(name, parent_collection, color_tag=None):
 
 # --- Collection Setup Operators ---
 class SCENE_OT_create_location_structure(bpy.types.Operator):
-    """Operator to build the LOCATION collection structure."""
+    """Operator to build the LOCATION collection structure and link ENVIROs."""
 
     bl_idname = "scene.create_location_structure"
     bl_label = "Setup LOCATION Collections"
-    bl_description = "Creates the collection structure for a LOCATION scene (LOC-)"
+    bl_description = "Creates the collection structure for a LOCATION scene (LOC-) and links all ENVIRO collections"
 
     def execute(self, context):
         scene = context.scene
@@ -160,16 +160,32 @@ class SCENE_OT_create_location_structure(bpy.types.Operator):
         get_or_create_collection(f"MODEL-{base_name}", loc_parent_col)
         get_or_create_collection(f"VFX-{base_name}", loc_parent_col)
 
+        # --- Link all existing ENVIRO collections ---
+        linked_enviros = []
+        for collection in bpy.data.collections:
+            # Check if it's an enviro parent collection
+            if collection.name.startswith("+ENV-") and collection.name.endswith("+"):
+                # Link if not already present in the scene's master collection
+                if collection.name not in master_collection.children:
+                    master_collection.children.link(collection)
+                    linked_enviros.append(collection.name)
+
+        if linked_enviros:
+            self.report(
+                {"INFO"},
+                f"Linked existing ENVIRO collections: {', '.join(linked_enviros)}",
+            )
+
         self.report({"INFO"}, f"Verified LOCATION structure for '{base_name}'.")
         return {"FINISHED"}
 
 
 class SCENE_OT_create_enviro_structure(bpy.types.Operator):
-    """Operator to build the ENVIRONMENT collection structure."""
+    """Operator to build the ENVIRONMENT collection structure and link LOCATION."""
 
     bl_idname = "scene.create_enviro_structure"
     bl_label = "Setup ENVIRO Collections"
-    bl_description = "Creates the collection structure for an ENVIRONMENT scene (ENV-)"
+    bl_description = "Creates the collection structure for an ENVIRONMENT scene (ENV-) and links the LOCATION collection"
 
     def execute(self, context):
         scene = context.scene
@@ -191,6 +207,17 @@ class SCENE_OT_create_enviro_structure(bpy.types.Operator):
 
         get_or_create_collection(f"MODEL-{base_name}", env_parent_col)
         get_or_create_collection(f"VFX-{base_name}", env_parent_col)
+        
+        # --- Link the root LOCATION collection ---
+        location_collection = next(
+            (c for c in bpy.data.collections if c.name.startswith("+LOC-")), None
+        )
+        if (
+            location_collection
+            and location_collection.name not in master_collection.children
+        ):
+            master_collection.children.link(location_collection)
+            self.report({"INFO"}, f"Linked Location: '{location_collection.name}'.")
 
         self.report({"INFO"}, f"Verified ENVIRO structure for '{base_name}'.")
         return {"FINISHED"}
