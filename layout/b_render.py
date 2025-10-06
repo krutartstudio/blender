@@ -1,10 +1,10 @@
 bl_info = {
     "name": "bRender",
     "author": "iori, Krutart, Gemini",
-    "version": (2, 4, 1),
-    "blender": (4, 1, 0),
+    "version": (2, 6, 1),
+    "blender": (4, 5, 0),
     "location": "3D View > Sidebar > bRender",
-    "description": "Creates dedicated, prepared render files for single shots or batches.",
+    "description": "Creates dedicated, prepared render files for single shots or batches with live progress tracking.",
     "warning": "This addon will save, create, and open files. Batch processing runs in the background.",
     "doc_url": "",
     "category": "Sequencer",
@@ -17,11 +17,12 @@ import logging
 import subprocess
 import sys
 import time
-import tempfile
+import threading
+import queue
 import shutil
 
 # --- SETUP LOGGER ---
-# Use a handler to ensure logs appear in the system console, especially for background processes
+# Main logger for the addon's interactive part.
 log = logging.getLogger("bRender")
 if not log.handlers:
     handler = logging.StreamHandler(sys.stdout)
@@ -30,8 +31,25 @@ if not log.handlers:
     log.addHandler(handler)
 log.setLevel(logging.INFO)
 
+# --- THREAD-SAFE QUEUE FOR SUBPROCESS LOGGING ---
+# This queue will hold output from the background process, read by a separate thread.
+log_queue = queue.Queue()
 
-# --- CORE LOGIC (UNCHANGED) ---
+def enqueue_output(out, q):
+    """
+    This function runs in a separate thread. It reads each line from the 
+    subprocess's output stream and puts it into the thread-safe queue.
+    """
+    try:
+        for line in iter(out.readline, b''):
+            q.put(line.decode('utf-8', errors='replace'))
+        out.close()
+    except Exception as e:
+        # Log exceptions that might occur if the stream closes unexpectedly
+        print(f"[bRender enqueue_output Thread Error]: {e}")
+
+
+# --- CORE LOGIC ---
 
 def _prepare_shot_in_current_file(context, shot_marker):
     """
@@ -51,13 +69,32 @@ def _prepare_shot_in_current_file(context, shot_marker):
     scene_number = name_match.group(1).upper()
     
     # --- 1. Get shot timing info ---
-    markers = sorted([m for m in context.scene.timeline_markers], key=lambda m: m.frame)
+    # Filter for valid shot markers only to ensure correct boundary detection. This is more robust
+    # than checking all markers, as it prevents non-shot markers from affecting timing.
+    shot_markers = sorted(
+        [m for m in context.scene.timeline_markers if re.match(r"CAM-SC\d+-SH\d+", m.name, re.IGNORECASE)],
+        key=lambda m: m.frame
+    )
+
     shot_start_frame = shot_marker.frame
-    shot_end_frame = context.scene.frame_end + 1
-    for m in markers:
-        if m.frame > shot_start_frame:
-            shot_end_frame = m.frame
-            break
+    shot_end_frame = context.scene.frame_end + 1  # Default for the last shot
+
+    # Find the next shot marker in the filtered list to determine the end frame.
+    try:
+        current_marker_index = shot_markers.index(shot_marker)
+        if current_marker_index < len(shot_markers) - 1:
+            next_marker = shot_markers[current_marker_index + 1]
+            shot_end_frame = next_marker.frame
+    except ValueError:
+        # This case should not happen if the passed shot_marker is valid, but as a fallback,
+        # revert to the old logic of checking all markers.
+        log.warning(f"Could not find shot marker '{shot_marker.name}' in the filtered list. Falling back to old method.")
+        all_markers = sorted([m for m in context.scene.timeline_markers], key=lambda m: m.frame)
+        for m in all_markers:
+            if m.frame > shot_start_frame:
+                shot_end_frame = m.frame
+                break
+
     shot_duration = shot_end_frame - shot_start_frame
     log.info(f"Shot timing found: Start={shot_start_frame}, End={shot_end_frame-1}, Duration={shot_duration} frames.")
 
@@ -80,7 +117,7 @@ def _prepare_shot_in_current_file(context, shot_marker):
             if strip.type == 'SOUND' and not guide_audio_strip: 
                 guide_audio_strip = strip
                 log.info(f"Found guide audio strip: '{strip.name}'")
-        if guide_video_strip and guide_audio_strip: break
+            if guide_video_strip and guide_audio_strip: break
     if not guide_video_strip: log.warning("No guide video strip found for this shot.")
     if not guide_audio_strip: log.warning("No guide audio strip found for this shot.")
 
@@ -125,15 +162,31 @@ def _prepare_shot_in_current_file(context, shot_marker):
         if hasattr(new_video, 'sound') and new_video.sound: new_video.sound.volume = 0
         log.info("Added video guide strip.")
 
-    # --- 6. Finalize render scene settings ---
+    # --- 6. Find and set the FULLDOME camera ---
+    log.info("Attempting to set FULLDOME camera.")
+    fulldome_camera_name = f"{shot_name}-FULLDOME"
+    fulldome_camera = bpy.data.objects.get(fulldome_camera_name)
+
+    if fulldome_camera and fulldome_camera.type == 'CAMERA':
+        render_scene.camera = fulldome_camera
+        log.info(f"Successfully set active camera to '{fulldome_camera_name}'.")
+    else:
+        log.warning(f"Could not find FULLDOME camera named '{fulldome_camera_name}'. The scene's active camera will be used instead.")
+
+    # --- 7. Finalize render scene settings ---
     log.info("Finalizing render scene settings.")
     render_scene.frame_start = shot_start_frame
     render_scene.frame_end = shot_end_frame - 1
     render_scene.render.resolution_x = source_scene.render.resolution_x
     render_scene.render.resolution_y = source_scene.render.resolution_y
     render_scene.render.film_transparent = True
-    context.window.scene = render_scene
     
+    # This check prevents errors in background mode where there is no window.
+    if context.window:
+        context.window.scene = render_scene
+    else:
+        log.info("No window context found (background mode). Active scene not set, but 'render' scene is prepared.")
+
     log.info(f"--- Successfully prepared shot: {shot_marker.name} ---")
     return True
 
@@ -180,17 +233,20 @@ class BRENDER_OT_prepare_active_shot(bpy.types.Operator):
         is_background_run = '--background-run' in sys.argv
         
         # --- BACKGROUND LOGIC ---
-        # This code runs inside a copied file in a separate Blender instance.
-        # It's lean: find marker, prepare the scene, and save the file it's in.
         if is_background_run:
             log.info("BACKGROUND: Executing 'Prepare Active Shot' in background mode.")
-            shot_info = get_shot_info_from_frame(context)
-            if not shot_info:
-                log.error("BACKGROUND: No active shot marker found at current frame. Aborting.")
-                # Non-zero exit code will signal failure to the modal operator
-                sys.exit(1) 
             
-            shot_marker = shot_info["shot_marker"]
+            target_shot_name = context.scene.get("brender_target_shot_name")
+            if not target_shot_name:
+                log.error("BACKGROUND: No target shot name found in custom property. Aborting.")
+                sys.exit(1)
+            
+            shot_marker = context.scene.timeline_markers.get(target_shot_name)
+            if not shot_marker:
+                log.error(f"BACKGROUND: Could not find marker named '{target_shot_name}'. Aborting.")
+                sys.exit(1)
+            
+            log.info(f"BACKGROUND: Found target shot marker '{shot_marker.name}' by name.")
             success = _prepare_shot_in_current_file(context, shot_marker)
             
             if success:
@@ -204,8 +260,6 @@ class BRENDER_OT_prepare_active_shot(bpy.types.Operator):
             return {'FINISHED'}
 
         # --- INTERACTIVE LOGIC ---
-        # This code runs in the user's main Blender instance.
-        # It handles all file operations: save, save_as, and re-opening the original file.
         log.info("INTERACTIVE: Executing 'Prepare Active Shot'.")
         original_filepath = bpy.data.filepath
         if not original_filepath:
@@ -241,7 +295,6 @@ class BRENDER_OT_prepare_active_shot(bpy.types.Operator):
         log.info(f"Saving new file as: {new_filepath}")
         bpy.ops.wm.save_as_mainfile(filepath=new_filepath)
 
-        # --- We are now in the context of the new file. Use try/finally for robustness. ---
         try:
             marker_in_new_file = bpy.context.scene.timeline_markers.get(shot_marker_name)
             if marker_in_new_file:
@@ -255,10 +308,57 @@ class BRENDER_OT_prepare_active_shot(bpy.types.Operator):
                 log.error(f"Could not find marker '{shot_marker_name}' in new file. Aborting preparation.")
         
         finally:
-            # --- This block ensures we always return to the original file ---
             log.info(f"Returning to original file: {original_filepath}")
             bpy.ops.wm.open_mainfile(filepath=original_filepath)
             
+        return {'FINISHED'}
+
+
+class BRENDER_OT_prepare_this_file(bpy.types.Operator):
+    bl_idname = "brender.prepare_this_file"
+    bl_label = "Prepare This File"
+    bl_description = "Prepares this file for rendering based on its filename (e.g., SC01-SH010.blend)"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        filepath = bpy.data.filepath
+        if not filepath:
+            return False
+        filename = os.path.basename(filepath)
+        return re.match(r"(SC\d+)-(SH\d+)\.blend", filename, re.IGNORECASE) is not None
+
+    def execute(self, context):
+        log.info("OPERATOR: Executing 'Prepare This File'.")
+        filepath = bpy.data.filepath
+        filename = os.path.basename(filepath)
+
+        name_match = re.match(r"(SC\d+)-(SH\d+)\.blend", filename, re.IGNORECASE)
+        if not name_match:
+            self.report({"ERROR"}, "Filename does not match the 'SC##-SH###.blend' format.")
+            return {"CANCELLED"}
+
+        scene_number, shot_number = name_match.group(1).upper(), name_match.group(2).upper()
+        target_shot_name = f"CAM-{scene_number}-{shot_number}"
+        log.info(f"Identified target shot from filename: {target_shot_name}")
+
+        shot_marker = context.scene.timeline_markers.get(target_shot_name)
+        if not shot_marker:
+            self.report({"ERROR"}, f"Could not find a timeline marker named '{target_shot_name}'.")
+            log.error(f"Failed to find marker '{target_shot_name}' in the current file.")
+            return {"CANCELLED"}
+        
+        log.info(f"Found marker '{shot_marker.name}'. Proceeding with preparation.")
+        success = _prepare_shot_in_current_file(context, shot_marker)
+
+        if success:
+            log.info("File preparation was successful. Saving.")
+            bpy.ops.wm.save_mainfile()
+            self.report({"INFO"}, f"Successfully prepared file for shot {target_shot_name}.")
+        else:
+            log.error("File preparation failed.")
+            self.report({"ERROR"}, "An error occurred during file preparation. Check the console.")
+
         return {'FINISHED'}
 
 
@@ -280,7 +380,7 @@ class BRENDER_OT_refresh_shot_list(bpy.types.Operator):
 
 
 class BRENDER_OT_prepare_render_batch(bpy.types.Operator):
-    """Processes selected shots in the background without reloading the main file."""
+    """Processes selected shots in the background with live log tracking."""
     bl_idname = "brender.prepare_render_batch"
     bl_label = "Prepare Batch From Selection"
     bl_description = "For each selected shot, create a prepared render file in a background process"
@@ -289,14 +389,77 @@ class BRENDER_OT_prepare_render_batch(bpy.types.Operator):
     _timer = None
     _shot_queue = []
     _current_process = None
+    _log_thread = None
     _start_time = 0.0
     _current_shot_name = None
-    _current_log_file = None
     _processed_shots = 0
     _total_shots = 0
     
-    # Constants - Increased timeout for potentially heavy operations
+    # Constants
     TIMEOUT_SECONDS = 300.0 # 5 minutes
+
+    # --- Python script template for the background process ---
+    # This is defined once at the class level for efficiency.
+    PY_COMMAND_TEMPLATE = """
+import bpy
+import sys
+import logging
+import re
+import os
+
+# --- Setup logging to print to stdout for the background process ---
+bRender_log = logging.getLogger("bRender")
+bRender_log.setLevel(logging.INFO)
+bRender_log.handlers.clear() 
+stdout_handler = logging.StreamHandler(sys.stdout)
+formatter = logging.Formatter('[BG %(levelname)s] %(message)s')
+stdout_handler.setFormatter(formatter)
+bRender_log.addHandler(stdout_handler)
+
+bRender_log.info("--- Background Process Started for {shot_name} ---")
+
+try:
+    addon_module = '{addon_name}'
+    bRender_log.info("Enabling addon: " + addon_module)
+    bpy.ops.preferences.addon_enable(module=addon_module)
+    bRender_log.info("Addon enabled successfully.")
+    
+    shot_marker_name = '{shot_name}'
+    bRender_log.info("Target shot: " + shot_marker_name)
+
+    name_match = re.match(r"CAM-(SC\\d+)-(SH\\d+)", shot_marker_name, re.IGNORECASE)
+    if not name_match:
+        bRender_log.error("Invalid marker format. Aborting.")
+        sys.exit(1)
+        
+    scene_number, shot_number = name_match.group(1).upper(), name_match.group(2).upper()
+    base_render_path = "S:\\\\3212-PREPRODUCTION_TEST\\\\LAYOUT\\\\LAYOUT_MOON_D\\\\LAYOUT_MOON_D-RENDER\\\\RENDER_FILE"
+    new_filename = scene_number + "-" + shot_number + ".blend"
+    new_filepath = os.path.join(base_render_path, new_filename)
+    os.makedirs(base_render_path, exist_ok=True)
+    bRender_log.info("Calculated new filepath: " + new_filepath)
+
+    # This is the critical fix. By removing `copy=True`, this becomes a true "Save As" operation.
+    # The script's context switches to the new file, preventing the original file from being modified.
+    bpy.ops.wm.save_as_mainfile(filepath=new_filepath)
+    bRender_log.info("Saved new file successfully. Context is now the new file.")
+
+    sys.argv.append('--background-run')
+    bpy.context.scene['brender_target_shot_name'] = shot_marker_name
+    bpy.context.scene.frame_set({shot_frame})
+    bRender_log.info("Frame set to {shot_frame} and target shot name stored.")
+
+    bRender_log.info("Calling 'prepare_active_shot' operator...")
+    bpy.ops.brender.prepare_active_shot()
+    bRender_log.info("'prepare_active_shot' operator finished.")
+
+except Exception as e:
+    bRender_log.error("An exception occurred during background processing: " + str(e), exc_info=True)
+    sys.exit(1) # Signal failure
+finally:
+    bRender_log.info("--- Background Process Finished ---")
+    sys.stdout.flush() # Ensure all output is written before exit
+"""
 
     def modal(self, context, event):
         if event.type in {'RIGHTMOUSE', 'ESC'}:
@@ -305,6 +468,16 @@ class BRENDER_OT_prepare_render_batch(bpy.types.Operator):
             return {'CANCELLED'}
 
         if event.type == 'TIMER':
+            # --- Drain the log queue and print any new messages ---
+            while not log_queue.empty():
+                try:
+                    line = log_queue.get_nowait()
+                    # Print line directly, as it comes from the background logger
+                    print(line, end='')
+                except queue.Empty:
+                    # This can happen if the queue becomes empty between the check and the get
+                    break
+            
             # --- Check on the currently running process ---
             if self._current_process:
                 # Check for timeout
@@ -340,6 +513,8 @@ class BRENDER_OT_prepare_render_batch(bpy.types.Operator):
                 
                 # Pop next shot from the queue
                 self._current_shot_name = self._shot_queue.pop(0)
+                
+                # Find the corresponding shot item from the list
                 shot_item = next((s for s in context.scene.brender_shot_list if s.name == self._current_shot_name), None)
 
                 if not shot_item:
@@ -348,91 +523,30 @@ class BRENDER_OT_prepare_render_batch(bpy.types.Operator):
 
                 log.info(f"BATCH ({self._processed_shots + 1}/{self._total_shots}): Starting background process for '{self._current_shot_name}' on frame {shot_item.frame}.")
                 
-                blender_executable = sys.executable
-                original_filepath = bpy.data.filepath # The master file to run the script on
+                blender_executable = bpy.app.binary_path
+                original_filepath = bpy.data.filepath
                 
-                # Create a temporary file for the background process to log to.
-                temp_log = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.log', prefix=f'brender_{self._current_shot_name}_')
-                self._current_log_file = temp_log.name
-                temp_log.close()
-                log.info(f"Created temporary log file for shot: {self._current_log_file}")
+                py_command = self.PY_COMMAND_TEMPLATE.format(
+                    addon_name=__name__,
+                    shot_name=self._current_shot_name,
+                    shot_frame=shot_item.frame
+                )
 
-                # This python expression will be executed in the background Blender instance.
-                # It now contains all logic for file creation and preparation.
-                py_command = f"""
-import bpy
-import sys
-import logging
-import re
-import os
-
-# --- Setup logging for this background process ---
-log_file_path = r'{self._current_log_file}'
-bRender_log = logging.getLogger("bRender")
-bRender_log.setLevel(logging.INFO)
-file_handler = logging.FileHandler(log_file_path)
-formatter = logging.Formatter('[BG] %(asctime)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(formatter)
-bRender_log.addHandler(file_handler)
-
-bRender_log.info("--- Background Process Started ---")
-
-try:
-    # --- This code is now self-contained for the background task ---
-    shot_marker_name = '{self._current_shot_name}'
-    bRender_log.info(f"Target shot: {{shot_marker_name}}")
-
-    # 1. Calculate the new file path, same logic as interactive operator
-    name_match = re.match(r"CAM-(SC\\d+)-(SH\\d+)", shot_marker_name, re.IGNORECASE)
-    if not name_match:
-        bRender_log.error("Invalid marker format. Aborting.")
-        sys.exit(1)
-        
-    scene_number, shot_number = name_match.group(1).upper(), name_match.group(2).upper()
-    # Use escaped backslashes for the string path inside the f-string
-    base_render_path = "S:\\\\3212-PREPRODUCTION_TEST\\\\LAYOUT\\\\LAYOUT_MOON_D\\\\LAYOUT_MOON_D-RENDER\\\\RENDER_FILE"
-    new_filename = f"{{scene_number}}-{{shot_number}}.blend"
-    new_filepath = os.path.join(base_render_path, new_filename)
-    os.makedirs(base_render_path, exist_ok=True)
-    bRender_log.info(f"Calculated new filepath: {{new_filepath}}")
-
-    # 2. Use 'save_as_mainfile' to create a clean copy with correct paths.
-    # This is the key change to fix broken links.
-    bpy.ops.wm.save_as_mainfile(filepath=new_filepath, copy=True)
-    bRender_log.info("Saved new file copy successfully. Context is now the new file.")
-
-    # 3. Add the '--background-run' flag so the operator knows it's in batch mode
-    sys.argv.append('--background-run')
-
-    # 4. Set the frame to ensure get_shot_info_from_frame() finds the correct marker
-    bpy.context.scene.frame_set({shot_item.frame})
-    bRender_log.info(f"Frame set to {shot_item.frame}")
-
-    # 5. Execute the preparation operator, which will now run its 'background' logic
-    bRender_log.info("Calling 'prepare_active_shot' operator...")
-    bpy.ops.brender.prepare_active_shot()
-    bRender_log.info("'prepare_active_shot' operator finished.")
-
-except Exception as e:
-    bRender_log.error(f"An exception occurred during background processing: {{e}}", exc_info=True)
-    sys.exit(1) # Signal failure
-finally:
-    bRender_log.info("--- Background Process Finished ---")
-    bRender_log.removeHandler(file_handler)
-    file_handler.close()
-    logging.shutdown()
-"""
-                
-                # The command now runs on the original file. The script it runs handles the copying.
                 command = [blender_executable, "-b", original_filepath, "--python-expr", py_command]
                 log.info(f"Executing command for '{self._current_shot_name}'")
                 
                 try:
                     self._current_process = subprocess.Popen(
                         command,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=False # We handle decoding in the thread
                     )
+                    
+                    self._log_thread = threading.Thread(target=enqueue_output, args=(self._current_process.stdout, log_queue))
+                    self._log_thread.daemon = True 
+                    self._log_thread.start()
+
                     self._start_time = time.time()
                     log.info(f"Process for '{self._current_shot_name}' launched with PID: {self._current_process.pid}")
                 except Exception as e:
@@ -448,26 +562,16 @@ finally:
         status = "SUCCESS" if success else ("FAILED" if not timed_out else "TIMED OUT")
         log.info(f"Finishing shot '{shot_name}' with status: {status}.")
 
-        if self._current_log_file and os.path.exists(self._current_log_file):
-            log.info(f"Reading log file: {self._current_log_file}")
+        if self._log_thread and self._log_thread.is_alive():
+            log.info(f"Waiting for logging thread of '{shot_name}' to complete.")
+            self._log_thread.join(timeout=1.0)
+        self._log_thread = None
+
+        while not log_queue.empty():
             try:
-                with open(self._current_log_file, 'r') as f:
-                    log_contents = f.read()
-                
-                if log_contents.strip():
-                    print(f"\n--- Log for {shot_name} ---\n{log_contents.strip()}\n--------------------\n")
-                else:
-                    log.warning(f"Log file for '{shot_name}' was empty.")
-
-                os.remove(self._current_log_file)
-                log.info(f"Removed log file: {self._current_log_file}")
-
-            except Exception as e:
-                log.error(f"Error reading or deleting log file '{self._current_log_file}': {e}")
-        else:
-             log.warning(f"Could not find log file for '{shot_name}': {self._current_log_file}")
-        
-        self._current_log_file = None
+                print(log_queue.get_nowait(), end='')
+            except queue.Empty:
+                break
 
         shot_item = next((s for s in context.scene.brender_shot_list if s.name == shot_name), None)
         if shot_item:
@@ -503,7 +607,7 @@ finally:
         log.info(f"Initializing batch preparation for {self._total_shots} shots: {self._shot_queue}")
 
         wm = context.window_manager
-        self._timer = wm.event_timer_add(0.5, window=context.window)
+        self._timer = wm.event_timer_add(0.2, window=context.window)
         wm.modal_handler_add(self)
         log.info("Modal handler added. Batch is now running.")
         
@@ -520,13 +624,6 @@ finally:
             except Exception as e:
                 log.error(f"Error killing process during cancel: {e}")
         
-        if self._current_log_file and os.path.exists(self._current_log_file):
-            try:
-                os.remove(self._current_log_file)
-                log.info(f"Removed orphaned log file on cancel: {self._current_log_file}")
-            except Exception as e:
-                 log.error(f"Could not remove orphaned log file on cancel: {e}")
-
         wm = context.window_manager
         if self._timer:
             wm.event_timer_remove(self._timer)
@@ -535,7 +632,7 @@ finally:
         
         self._shot_queue.clear()
         self._current_shot_name = None
-        self._current_log_file = None
+        self._log_thread = None
         log.info("Modal operator cancelled and internal state cleaned up.")
         for area in context.screen.areas:
             if area.type == 'VIEW_3D':
@@ -584,6 +681,14 @@ class VIEW3D_PT_brender_panel(bpy.types.Panel):
         layout.separator()
 
         box = layout.box()
+        box.label(text="Manual File Preparation", icon="FILE_BLEND")
+        col = box.column()
+        col.operator(BRENDER_OT_prepare_this_file.bl_idname, icon="PREFERENCES")
+        col.label(text="Use in a SC##-SH###.blend file")
+
+        layout.separator()
+
+        box = layout.box()
         row = box.row(align=True)
         row.label(text="Batch Shot Preparation", icon="FILE_TICK")
         row.operator(BRENDER_OT_refresh_shot_list.bl_idname, text="", icon="FILE_REFRESH")
@@ -596,7 +701,6 @@ class VIEW3D_PT_brender_panel(bpy.types.Panel):
             box.separator()
             
             is_running = False
-            # Check if modal is running by iterating through active operators
             op_props = context.window_manager.operators
             if op_props:
                 for op in op_props:
@@ -615,6 +719,7 @@ class VIEW3D_PT_brender_panel(bpy.types.Panel):
 classes = (
     BRENDER_ShotListItem,
     BRENDER_OT_prepare_active_shot,
+    BRENDER_OT_prepare_this_file,
     BRENDER_OT_refresh_shot_list,
     BRENDER_OT_prepare_render_batch,
     BRENDER_OT_report_finished,
@@ -636,6 +741,4 @@ def unregister():
 
 if __name__ == "__main__":
     register()
-
-
 
