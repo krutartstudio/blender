@@ -150,6 +150,8 @@ def _prepare_shot_in_current_file(context, shot_marker):
 
     if guide_video_strip:
         new_video = vse_render.sequences.new_movie(
+            # 3212-{enviroment_scene_name}-SH###-layout_r-v###(n+1)
+            #example "3212-sc17-apollo_crash-sh160-layout_r-v001"
             name=f"{shot_name}-guide_video",
             filepath=bpy.path.abspath(guide_video_strip.filepath),
             channel=3, frame_start=shot_start_frame)

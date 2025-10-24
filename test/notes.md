@@ -1,8 +1,61 @@
+###let's add this hide from view layer functionality into our layout-suite.py blender addon. please make sure nothing breaks and ensure compatibilty with both blender 4.2 and blender 4.5.
+
+###when appending cameras, don't add __ to cam_boneshapes collection name, just disable all the "cam_boneshapes-SC##-SH###" collections using the provided hide_from_view functionality.
+
+
+###hide_from_view:
+@log_fn_call
+
+def find_view_collections_by_substring_in_collection(layer_collection, substring):
+
+    matching_collections = []
+
+    if substring in layer_collection.name:
+
+        matching_collections.append(layer_collection)
+
+    for child in layer_collection.children:
+
+        matching_collections.extend(
+
+            find_view_collections_by_substring_in_collection(child, substring))
+
+    return matching_collections
+
+
+@log_fn_call
+
+def exclude_collections(new_state=True):
+
+    if new_state is True:
+
+        target_collection = find_view_collections_by_substring_in_collection(
+
+            bpy.context.view_layer.layer_collection, '+LGT+')
+
+
+        for col in target_collection:
+
+            col.exclude = new_state
+
+
+    target_collection = find_view_collections_by_substring_in_collection(
+
+        bpy.context.view_layer.layer_collection, '+LGT_MAIN+')
+
+
+    for col in target_collection:
+
+        if col.exclude != new_state:
+
+            col.exclude = new_state 
+
+###layout-suite.py:
 bl_info = {
     "name": "Layout Suite",
-    "author": "IORI, Krutart, Gemini",
-    "version": (2, 8, 2),
-    "blender": (4, 2, 0),
+    "author": "IORI, Gemini, Krutart",
+    "version": (2, 3, 2),
+    "blender": (4, 1, 0),
     "location": "3D View > UI > Layout Suite",
     "description": "A unified addon to initialize collection structures, import animatics, and set up cameras from timeline markers based on a specific studio pipeline.",
     "warning": "",
@@ -25,40 +78,32 @@ log = logging.getLogger(__name__)
 
 
 # --- Addon Preferences ---
-# Allows users to set paths for the camera rig file for different OS.
+# Allows users to set the path for the camera rig file in addon preferences.
 class LayoutCameraAddonPreferences(AddonPreferences):
     bl_idname = __name__
 
-    camera_hero_path_windows: StringProperty(
-        name="Windows Camera Hero File",
-        description="Path to the master camera rig .blend file for Windows (Priority)",
-        subtype="FILE_PATH",
-        default=r"S:\3212-PREPRODUCTION\LIBRARY\LIBRARY-HERO\RIG-HERO\CAMERA-HERO\3212_camera-hero.blend",
-    )
-    camera_hero_path_linux: StringProperty(
-        name="Linux Camera Hero File",
-        description="Path to the master camera rig .blend file for Linux",
+    camera_hero_path: StringProperty(
+        name="Camera Hero File",
+        description="Path to the master camera rig .blend file",
         subtype="FILE_PATH",
         default="/run/user/1000/gvfs/afp-volume:host=172.16.20.2,user=fred,volume=VELKE_PROJEKTY/3212-PREPRODUCTION/LIBRARY/LIBRARY-HERO/RIG-HERO/CAMERA-HERO/3212_camera-hero.blend",
     )
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Camera Hero File Paths:")
-        layout.prop(self, "camera_hero_path_windows")
-        layout.prop(self, "camera_hero_path_linux")
+        layout.prop(self, "camera_hero_path")
 
 
 # --- Constants ---
 # Color tags for collection organization
 COLLECTION_COLORS = {
-    "LOCATION": "COLOR_08",
-    "ENVIRO": "COLOR_02",
-    "SCENE": "COLOR_03",
-    "ART": "COLOR_05",
-    "ANI": "COLOR_01",
-    "VFX": "COLOR_04",
-    "CAMERA": "COLOR_06",
+    "LOCATION": "COLOR_05",  # Blue
+    "ENVIRO": "COLOR_04",  # Green
+    "SCENE": "COLOR_01",  # Red
+    "ART": "COLOR_02",  # Yellow
+    "ANI": "COLOR_03",  # Orange
+    "VFX": "COLOR_06",  # Pink/Magenta
+    "CAMERA": "COLOR_07",  # Purple
 }
 
 # Name of the camera collection to append from the hero file
@@ -66,47 +111,6 @@ CAMERA_COLLECTION_TO_APPEND = "+CAMERA+"
 
 
 # --- Helper Functions ---
-
-def find_view_collections_by_substring_in_collection(layer_collection, substring):
-    """
-    Recursively finds all view layer collections whose names contain a specific substring,
-    starting the search from a given layer_collection.
-    This is used to target collections for hiding/excluding without needing their exact names.
-    """
-    matching_collections = []
-    # Check if the current collection's name matches
-    if substring in layer_collection.name:
-        matching_collections.append(layer_collection)
-    # Recursively check all children
-    for child in layer_collection.children:
-        matching_collections.extend(
-            find_view_collections_by_substring_in_collection(child, substring)
-        )
-    return matching_collections
-
-
-def hide_collections_in_view_layer(substring, hide=True):
-    """
-    Finds and hides/unhides (by setting the 'exclude' property) all collections
-    in the active view layer that contain a given substring in their name.
-    """
-    log.info(f"Attempting to set exclude={hide} for collections containing '{substring}'.")
-    view_layer_collections = find_view_collections_by_substring_in_collection(
-        bpy.context.view_layer.layer_collection, substring
-    )
-
-    if not view_layer_collections:
-        log.warning(f"No view layer collections found with substring: '{substring}'.")
-        return
-
-    hidden_count = 0
-    for col in view_layer_collections:
-        if col.exclude != hide:
-            col.exclude = hide
-            hidden_count += 1
-    log.info(f"Set exclude={hide} for {hidden_count} collection(s) containing '{substring}'.")
-
-
 def get_or_create_collection(name, parent_collection, color_tag=None):
     """
     Checks if a collection exists. If so, links it. If not, creates it.
@@ -132,11 +136,11 @@ def get_or_create_collection(name, parent_collection, color_tag=None):
 
 # --- Collection Setup Operators ---
 class SCENE_OT_create_location_structure(bpy.types.Operator):
-    """Operator to build the LOCATION collection structure and link ENVIROs."""
+    """Operator to build the LOCATION collection structure."""
 
     bl_idname = "scene.create_location_structure"
     bl_label = "Setup LOCATION Collections"
-    bl_description = "Creates the collection structure for a LOCATION scene (LOC-) and links all ENVIRO collections"
+    bl_description = "Creates the collection structure for a LOCATION scene (LOC-)"
 
     def execute(self, context):
         scene = context.scene
@@ -160,32 +164,16 @@ class SCENE_OT_create_location_structure(bpy.types.Operator):
         get_or_create_collection(f"MODEL-{base_name}", loc_parent_col)
         get_or_create_collection(f"VFX-{base_name}", loc_parent_col)
 
-        # --- Link all existing ENVIRO collections ---
-        linked_enviros = []
-        for collection in bpy.data.collections:
-            # Check if it's an enviro parent collection
-            if collection.name.startswith("+ENV-") and collection.name.endswith("+"):
-                # Link if not already present in the scene's master collection
-                if collection.name not in master_collection.children:
-                    master_collection.children.link(collection)
-                    linked_enviros.append(collection.name)
-
-        if linked_enviros:
-            self.report(
-                {"INFO"},
-                f"Linked existing ENVIRO collections: {', '.join(linked_enviros)}",
-            )
-
         self.report({"INFO"}, f"Verified LOCATION structure for '{base_name}'.")
         return {"FINISHED"}
 
 
 class SCENE_OT_create_enviro_structure(bpy.types.Operator):
-    """Operator to build the ENVIRONMENT collection structure and link LOCATION."""
+    """Operator to build the ENVIRONMENT collection structure."""
 
     bl_idname = "scene.create_enviro_structure"
     bl_label = "Setup ENVIRO Collections"
-    bl_description = "Creates the collection structure for an ENVIRONMENT scene (ENV-) and links the LOCATION collection"
+    bl_description = "Creates the collection structure for an ENVIRONMENT scene (ENV-)"
 
     def execute(self, context):
         scene = context.scene
@@ -207,17 +195,6 @@ class SCENE_OT_create_enviro_structure(bpy.types.Operator):
 
         get_or_create_collection(f"MODEL-{base_name}", env_parent_col)
         get_or_create_collection(f"VFX-{base_name}", env_parent_col)
-        
-        # --- Link the root LOCATION collection ---
-        location_collection = next(
-            (c for c in bpy.data.collections if c.name.startswith("+LOC-")), None
-        )
-        if (
-            location_collection
-            and location_collection.name not in master_collection.children
-        ):
-            master_collection.children.link(location_collection)
-            self.report({"INFO"}, f"Linked Location: '{location_collection.name}'.")
 
         self.report({"INFO"}, f"Verified ENVIRO structure for '{base_name}'.")
         return {"FINISHED"}
@@ -245,6 +222,7 @@ class SCENE_OT_create_scene_structure(bpy.types.Operator):
             return {"CANCELLED"}
 
         sc_id, scene_env_name = match.groups()
+        sh_id = "SH001"  # Default for initial setup
         parent_col_name = f"+{base_name}+"
 
         sc_parent_col, created = get_or_create_collection(
@@ -261,22 +239,22 @@ class SCENE_OT_create_scene_structure(bpy.types.Operator):
             f"+ART-{base_name}+", sc_parent_col, color_tag=COLLECTION_COLORS["ART"]
         )
         get_or_create_collection(f"MODEL-{base_name}", art_col)
-        # Create the parent for shot-specific art collections, but not the shots themselves.
-        get_or_create_collection(f"SHOT-ART-{base_name}", art_col)
+        shot_art_col, _ = get_or_create_collection(f"SHOT-ART-{base_name}", art_col)
+        get_or_create_collection(f"MODEL-{sc_id}-{sh_id}", shot_art_col)
 
         ani_col, _ = get_or_create_collection(
             f"+ANI-{base_name}+", sc_parent_col, color_tag=COLLECTION_COLORS["ANI"]
         )
         get_or_create_collection(f"ACTOR-{base_name}", ani_col)
         get_or_create_collection(f"PROP-{base_name}", ani_col)
-        get_or_create_collection(f"SHOT-ANI-{base_name}", ani_col)
+        shot_ani_col, _ = get_or_create_collection(f"SHOT-ANI-{base_name}", ani_col)
 
         vfx_col, _ = get_or_create_collection(
             f"+VFX-{base_name}+", sc_parent_col, color_tag=COLLECTION_COLORS["VFX"]
         )
         get_or_create_collection(f"VFX-{base_name}", vfx_col)
-        # Create the parent for shot-specific vfx collections, but not the shots themselves.
-        get_or_create_collection(f"SHOT-VFX-{base_name}", vfx_col)
+        shot_vfx_col, _ = get_or_create_collection(f"SHOT-VFX-{base_name}", vfx_col)
+        get_or_create_collection(f"VFX-{sc_id}-{sh_id}", shot_vfx_col)
 
         # --- Link Environment & Location Collections ---
         linked_enviros = []
@@ -369,31 +347,22 @@ class SCENE_OT_verify_shot_collections(bpy.types.Operator):
 
 # --- Animatic and Camera Operators ---
 class SEQUENCER_OT_import_animatic_guides(bpy.types.Operator):
-    """Scans a selected scene directory, creates a Blender scene if needed, and imports/updates the animatic 'guide' videos with sound."""
+    """Scans a directory for scene folders, creates Blender scenes, and imports animatic 'guide' videos with sound."""
 
     bl_idname = "sequencer.import_animatic_guides"
     bl_label = "Import/Update Animatic Guides"
     bl_options = {"REGISTER", "UNDO"}
 
     directory: StringProperty(
-        name="Scene Directory",
-        description="Select the scene directory (e.g., SC17-DARKPOINT) containing the guide files",
+        name="Source Directory",
+        description="Select the root directory containing scene folders (e.g., SC17-APOLLO_CRASH)",
         subtype="DIR_PATH",
     )
 
     def execute(self, context):
-        scene_path = self.directory
-        if not os.path.isdir(scene_path):
+        root_dir = self.directory
+        if not os.path.isdir(root_dir):
             self.report({"ERROR"}, "Invalid directory selected.")
-            return {"CANCELLED"}
-
-        # Get scene name from the selected directory path and ensure it's valid
-        scene_name = os.path.basename(os.path.normpath(scene_path))
-        if not scene_name.upper().startswith("SC"):
-            self.report(
-                {"ERROR"},
-                f"Directory name '{scene_name}' does not start with 'SC'. Please select a valid scene directory.",
-            )
             return {"CANCELLED"}
 
         vse_area = next((area for area in context.screen.areas if area.type == 'SEQUENCE_EDITOR'), None)
@@ -401,152 +370,150 @@ class SEQUENCER_OT_import_animatic_guides(bpy.types.Operator):
             self.report({'ERROR'}, "Operation requires a Video Sequence Editor to be open in the workspace.")
             return {'CANCELLED'}
 
-        # Find all guide files within the selected scene directory
-        guide_files = []
         try:
+            scene_dirs = [
+                d
+                for d in os.listdir(root_dir)
+                if os.path.isdir(os.path.join(root_dir, d))
+                and d.upper().startswith("SC")
+            ]
+        except OSError as e:
+            self.report({"ERROR"}, f"Could not read directory: {e}")
+            return {"CANCELLED"}
+
+        if not scene_dirs:
+            self.report(
+                {"WARNING"},
+                f"No scene directories (e.g., 'SC17-...') found in '{root_dir}'",
+            )
+            return {"FINISHED"}
+
+        for scene_name in scene_dirs:
+            blender_scene = bpy.data.scenes.get(scene_name)
+            if not blender_scene:
+                blender_scene = bpy.data.scenes.new(name=scene_name)
+                self.report({"INFO"}, f"Created new scene: '{scene_name}'")
+            else:
+                self.report({"INFO"}, f"Found existing scene: '{scene_name}'")
+
+            if not blender_scene.sequence_editor:
+                blender_scene.sequence_editor_create()
+            seq_editor = blender_scene.sequence_editor
+
+            scene_path = os.path.join(root_dir, scene_name)
+            guide_files = []
             for dirpath, _, filenames in os.walk(scene_path):
                 for f in filenames:
                     if "-guide-" in f.lower() and f.lower().endswith((".mp4", ".mov")):
                         guide_files.append(os.path.join(dirpath, f))
-        except OSError as e:
-            self.report({"ERROR"}, f"Could not read directory contents: {e}")
-            return {"CANCELLED"}
 
-        if not guide_files:
-            self.report(
-                {"WARNING"},
-                f"No guide files found in '{scene_path}'. Nothing to import.",
-            )
-            return {"FINISHED"}
-
-        # --- Scene Creation and Setup ---
-        blender_scene = bpy.data.scenes.get(scene_name)
-        if not blender_scene:
-            blender_scene = bpy.data.scenes.new(name=scene_name)
-            self.report({"INFO"}, f"Created new scene: '{scene_name}'")
-            try:
-                # Use a context override to run the operator on the new scene.
-                with context.temp_override(scene=blender_scene):
-                    bpy.ops.scene.create_scene_structure()
-                self.report({"INFO"}, f"Automatically ran 'Setup SCENE Collections' for '{scene_name}'.")
-            except Exception as e:
-                self.report({'ERROR'}, f"Could not auto-run scene setup for '{scene_name}': {e}. Please run it manually.")
-        else:
-            self.report({"INFO"}, f"Found existing scene: '{scene_name}'")
-
-        if not blender_scene.sequence_editor:
-            blender_scene.sequence_editor_create()
-        seq_editor = blender_scene.sequence_editor
-
-        guide_files.sort()
-        
-        # --- Clean up old guide strips for this scene before importing ---
-        strips_to_remove = []
-        for s in seq_editor.sequences_all:
-            path_to_check = None
-            if s.type == 'MOVIE':
-                path_to_check = s.filepath
-            elif s.type == 'SOUND':
-                path_to_check = s.sound.filepath
-
-            # Check if the strip's path is inside the selected scene_path and is a guide file
-            if path_to_check and os.path.normpath(path_to_check).startswith(os.path.normpath(scene_path)) and "-guide-" in os.path.basename(path_to_check).lower():
-                strips_to_remove.append(s)
-
-        if strips_to_remove:
-            log.info(f"Removing {len(strips_to_remove)} old guide strips from scene '{scene_name}'.")
-            for strip in strips_to_remove:
-                if strip.name in seq_editor.sequences:
-                    seq_editor.sequences.remove(strip)
-
-        # --- Clean up old markers for this scene ---
-        sc_match = re.match(r"^(SC\d+)", scene_name, re.IGNORECASE)
-        if sc_match:
-            current_sc_id = sc_match.group(1).upper()
-            markers_to_remove = [
-                m
-                for m in blender_scene.timeline_markers
-                if m.name.startswith(f"CAM-{current_sc_id}-")
-            ]
-
-            if markers_to_remove:
-                log.info(
-                    f"Removing {len(markers_to_remove)} old markers for {current_sc_id} before update."
-                )
-                for m in markers_to_remove:
-                    blender_scene.timeline_markers.remove(m)
-
-        # --- Import to new channels ---
-        max_channel = 0
-        if seq_editor.sequences_all:
-            max_channel = max(s.channel for s in seq_editor.sequences_all)
-        
-        target_channel = max_channel + 1
-        self.report(
-            {"INFO"},
-            f"Importing guides for '{scene_name}' to Video Channel {target_channel} and Sound Channel {target_channel + 1}.",
-        )
-
-        current_frame = 1
-        for video_path in guide_files:
-            filename = os.path.basename(video_path)
-
-            with context.temp_override(window=context.window, area=vse_area, scene=blender_scene):
-                bpy.ops.sequencer.movie_strip_add(
-                    filepath=video_path,
-                    directory=os.path.dirname(video_path),
-                    files=[{"name": filename}],
-                    frame_start=current_frame,
-                    channel=target_channel,
-                    fit_method='FIT',
-                    adjust_playback_rate=True
-                )
-
-            new_video_strip = None
-            for s in reversed(seq_editor.sequences_all):
-                if s.channel == target_channel and s.frame_start == current_frame:
-                    new_video_strip = s
-                    break
-            
-            if not new_video_strip:
-                self.report({"WARNING"}, f"Failed to import or find video strip from: {video_path}")
-                current_frame += 1 
-                continue
-
-            # Create new markers
-            match = re.search(r"(sc\d+).+?(sh\d+)", filename, re.IGNORECASE)
-            if match:
-                sc_id, sh_id = match.groups()
-                marker_name = f"CAM-{sc_id.upper()}-{sh_id.upper()}"
-                blender_scene.timeline_markers.new(
-                    name=marker_name, frame=current_frame
-                )
-                self.report(
-                    {"INFO"},
-                    f"Created marker '{marker_name}' at frame {current_frame}.",
-                )
-            else:
+            if not guide_files:
                 self.report(
                     {"WARNING"},
-                    f"Could not parse SC/SH from '{filename}'. Skipping marker creation.",
+                    f"No guide files found for scene '{scene_name}'. Skipping.",
                 )
+                continue
 
-            current_frame += new_video_strip.frame_final_duration
+            guide_files.sort()
+            
+            # --- NEW: Clean up old guide strips for this scene before importing ---
+            strips_to_remove = []
+            for s in seq_editor.sequences_all:
+                path_to_check = None
+                if s.type == 'MOVIE':
+                    path_to_check = s.filepath
+                elif s.type == 'SOUND':
+                    path_to_check = s.sound.filepath
 
-        blender_scene.frame_end = current_frame - 1
-        log.info(f"Set scene '{scene_name}' end frame to {blender_scene.frame_end}")
+                if path_to_check and path_to_check.startswith(scene_path) and "-guide-" in os.path.basename(path_to_check).lower():
+                    strips_to_remove.append(s)
 
-        # --- Add an END marker ---
-        # Remove any existing 'END' marker to ensure a clean update.
-        end_marker = next((m for m in blender_scene.timeline_markers if m.name == "END"), None)
-        if end_marker:
-            blender_scene.timeline_markers.remove(end_marker)
+            if strips_to_remove:
+                log.info(f"Removing {len(strips_to_remove)} old guide strips from scene '{scene_name}'.")
+                for strip in strips_to_remove:
+                    if strip.name in seq_editor.sequences:
+                         seq_editor.sequences.remove(strip)
+            # --- END NEW CODE ---
 
-        # Add the new END marker at the frame immediately after the last clip.
-        blender_scene.timeline_markers.new(name="END", frame=current_frame)
-        log.info(f"Created 'END' marker at frame {current_frame}.")
 
-        self.report({"INFO"}, f"Animatic import for '{scene_name}' finished.")
+            # --- Clean up old markers for this scene ---
+            sc_match = re.match(r"^(SC\d+)", scene_name, re.IGNORECASE)
+            if sc_match:
+                current_sc_id = sc_match.group(1).upper()
+                markers_to_remove = [
+                    m
+                    for m in blender_scene.timeline_markers
+                    if m.name.startswith(f"CAM-{current_sc_id}-")
+                ]
+
+                if markers_to_remove:
+                    log.info(
+                        f"Removing {len(markers_to_remove)} old markers for {current_sc_id} before update."
+                    )
+                    for m in markers_to_remove:
+                        blender_scene.timeline_markers.remove(m)
+
+            # --- Import to new channels ---
+            max_channel = 0
+            if seq_editor.sequences_all:
+                max_channel = max(s.channel for s in seq_editor.sequences_all)
+            
+            target_channel = max_channel + 1
+            self.report(
+                {"INFO"},
+                f"Importing guides for '{scene_name}' to Video Channel {target_channel} and Sound Channel {target_channel + 1}.",
+            )
+
+            current_frame = 1
+            for video_path in guide_files:
+                filename = os.path.basename(video_path)
+
+                with context.temp_override(window=context.window, area=vse_area, scene=blender_scene):
+                    bpy.ops.sequencer.movie_strip_add(
+                        filepath=video_path,
+                        directory=os.path.dirname(video_path),
+                        files=[{"name": filename}],
+                        frame_start=current_frame,
+                        channel=target_channel,
+                        fit_method='FIT',
+                        adjust_playback_rate=True
+                    )
+
+                new_video_strip = None
+                for s in reversed(seq_editor.sequences_all):
+                    if s.channel == target_channel and s.frame_start == current_frame:
+                        new_video_strip = s
+                        break
+                
+                if not new_video_strip:
+                    self.report({"WARNING"}, f"Failed to import or find video strip from: {video_path}")
+                    current_frame += 1 
+                    continue
+
+                # Create new markers
+                match = re.search(r"(sc\d+).+?(sh\d+)", filename, re.IGNORECASE)
+                if match:
+                    sc_id, sh_id = match.groups()
+                    marker_name = f"CAM-{sc_id.upper()}-{sh_id.upper()}"
+                    blender_scene.timeline_markers.new(
+                        name=marker_name, frame=current_frame
+                    )
+                    self.report(
+                        {"INFO"},
+                        f"Created marker '{marker_name}' at frame {current_frame}.",
+                    )
+                else:
+                    self.report(
+                        {"WARNING"},
+                        f"Could not parse SC/SH from '{filename}'. Skipping marker creation.",
+                    )
+
+                current_frame += new_video_strip.frame_final_duration
+
+            blender_scene.frame_end = current_frame - 1
+            log.info(f"Set scene '{scene_name}' end frame to {blender_scene.frame_end}")
+
+        self.report({"INFO"}, "Animatic import process finished.")
         return {"FINISHED"}
 
     def invoke(self, context, event):
@@ -555,12 +522,12 @@ class SEQUENCER_OT_import_animatic_guides(bpy.types.Operator):
 
 
 class SCENE_OT_setup_cameras_from_markers(bpy.types.Operator):
-    """Scans timeline markers, creates shot collections for ANI, ART, and VFX, and appends the master camera rig."""
+    """Scans timeline markers, creates a collection for each camera shot, and appends the master camera rig."""
 
     bl_idname = "scene.setup_cameras_from_markers"
-    bl_label = "setup shots"
+    bl_label = "Setup Cameras from Markers"
     bl_description = (
-        "Creates and places cameras and shot collections based on timeline markers"
+        "Creates and places cameras into collections based on timeline markers"
     )
 
     def execute(self, context):
@@ -568,19 +535,7 @@ class SCENE_OT_setup_cameras_from_markers(bpy.types.Operator):
         base_name = scene.name
         markers = scene.timeline_markers
         preferences = context.preferences.addons[__name__].preferences
-        
-        # --- Determine the correct camera hero path based on OS ---
-        win_path = preferences.camera_hero_path_windows
-        linux_path = preferences.camera_hero_path_linux
-
-        camera_hero_blend_path = None
-        if win_path and os.path.exists(win_path):
-            camera_hero_blend_path = win_path
-            log.info(f"Using Windows camera hero path: {win_path}")
-        elif linux_path and os.path.exists(linux_path):
-            camera_hero_blend_path = linux_path
-            log.info(f"Using Linux camera hero path: {linux_path}")
-        # --- End path determination ---
+        camera_hero_blend_path = preferences.camera_hero_path
 
         log.info("--- Starting Camera Setup from Markers ---")
 
@@ -596,30 +551,16 @@ class SCENE_OT_setup_cameras_from_markers(bpy.types.Operator):
             self.report({"WARNING"}, msg)
             return {"FINISHED"}
 
-        if not camera_hero_blend_path:
-            msg = (f"Camera hero file not found. Please check paths in Addon Preferences.\n"
-                   f"Windows (checked): '{win_path}'\n"
-                   f"Linux (checked): '{linux_path}'")
+        if not camera_hero_blend_path or not os.path.exists(camera_hero_blend_path):
+            msg = f"Camera hero file not found. Please set the path in Addon Preferences. Current: '{camera_hero_blend_path}'"
             log.error(msg)
             self.report({"ERROR"}, msg)
             return {"CANCELLED"}
-            
-        # --- Get all parent SHOT collections ---
+
         shot_ani_collection_name = f"SHOT-ANI-{base_name}"
-        shot_art_collection_name = f"SHOT-ART-{base_name}"
-        shot_vfx_collection_name = f"SHOT-VFX-{base_name}"
-
         shot_ani_collection = bpy.data.collections.get(shot_ani_collection_name)
-        shot_art_collection = bpy.data.collections.get(shot_art_collection_name)
-        shot_vfx_collection = bpy.data.collections.get(shot_vfx_collection_name)
-
-        # Verify all parent collections exist before continuing
-        if not all([shot_ani_collection, shot_art_collection, shot_vfx_collection]):
-            missing = []
-            if not shot_ani_collection: missing.append(f"'{shot_ani_collection_name}'")
-            if not shot_art_collection: missing.append(f"'{shot_art_collection_name}'")
-            if not shot_vfx_collection: missing.append(f"'{shot_vfx_collection_name}'")
-            msg = f"Parent collection(s) not found: {', '.join(missing)}. Please run the main 'Setup SCENE Collections' first."
+        if not shot_ani_collection:
+            msg = f"Parent collection '{shot_ani_collection_name}' not found. Please run the main layout setup first."
             log.error(msg)
             self.report({"ERROR"}, msg)
             return {"CANCELLED"}
@@ -636,26 +577,14 @@ class SCENE_OT_setup_cameras_from_markers(bpy.types.Operator):
 
             sc_id, sh_id = match.groups()
             sc_id_upper, sh_id_upper = sc_id.upper(), sh_id.upper()
-            
-            # --- Define all shot collection names ---
             cam_collection_name = f"CAM-{sc_id_upper}-{sh_id_upper}"
-            art_shot_col_name = f"MODEL-{sc_id_upper}-{sh_id_upper}"
-            vfx_shot_col_name = f"VFX-{sc_id_upper}-{sh_id_upper}"
 
-            # If the primary camera collection exists, assume all are created and skip.
             if cam_collection_name in shot_ani_collection.children:
                 log.info(
-                    f"Shot collections for '{cam_collection_name}' already exist. Skipping."
+                    f"Camera collection '{cam_collection_name}' already exists. Skipping."
                 )
                 continue
 
-            # --- Create ART and VFX shot collections ---
-            get_or_create_collection(art_shot_col_name, shot_art_collection)
-            log.info(f"Created ART shot collection '{art_shot_col_name}'.")
-            get_or_create_collection(vfx_shot_col_name, shot_vfx_collection)
-            log.info(f"Created VFX shot collection '{vfx_shot_col_name}'.")
-
-            # --- Create Camera (ANI) shot collection and append rig ---
             try:
                 with bpy.data.libraries.load(camera_hero_blend_path, link=False) as (
                     data_from,
@@ -720,10 +649,7 @@ class SCENE_OT_setup_cameras_from_markers(bpy.types.Operator):
                             )
 
                     elif "cam_boneshapes" in child_col.name:
-                        # Rename without the '__' prefix. Hiding is handled globally later.
-                        child_col.name = f"cam_boneshapes-{sc_id_upper}-{sh_id_upper}"
-                        log.info(f"Renamed bone shape collection to '{child_col.name}'.")
-
+                        child_col.name = f"__cam_boneshapes-{sc_id_upper}-{sh_id_upper}"
 
                 camera_offset_counter += 1
 
@@ -740,16 +666,11 @@ class SCENE_OT_setup_cameras_from_markers(bpy.types.Operator):
                 log.error(msg, exc_info=True)
                 self.report({"ERROR"}, msg)
                 if (
-                    'appended_collection' in locals()
-                    and appended_collection
+                    appended_collection
                     and appended_collection.name in bpy.data.collections
                 ):
                     bpy.data.collections.remove(appended_collection)
                 continue
-
-        # --- Hide all bone shape collections after processing all markers ---
-        # This is more efficient than calling it inside the loop for every camera.
-        hide_collections_in_view_layer("cam_boneshapes", hide=True)
 
         log.info(
             f"--- Camera Setup Finished. Processed {processed_markers} markers. ---"
@@ -785,7 +706,7 @@ class SCENE_OT_bind_cameras_to_markers(bpy.types.Operator):
 
         log.info(f"--- Starting Camera Binding for '{self.camera_type}' cameras ---")
 
-        # --- Set render resolution based on camera type ---
+        # --- NEW: Set render resolution based on camera type ---
         if self.camera_type == "FLAT":
             scene.render.resolution_x = 1920
             scene.render.resolution_y = 1080
@@ -796,7 +717,7 @@ class SCENE_OT_bind_cameras_to_markers(bpy.types.Operator):
             scene.render.resolution_y = 2048
             log.info("Set render resolution to 2048x2048 for FULLDOME cameras.")
             self.report({"INFO"}, "Set resolution to 2048x2048 (FULLDOME).")
-        # --- END ---
+        # --- END NEW CODE ---
 
         if not markers:
             msg = "No timeline markers found in the scene."

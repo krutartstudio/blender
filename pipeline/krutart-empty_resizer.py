@@ -1,8 +1,8 @@
 # <pep8 compliant>
 
 bl_info = {
-    "name": "Resize Empties",
-    "author": "Gemini",
+    "name": "Krutart Empty Resizer",
+    "author": "iori, Krutart, Gemini",
     "version": (1, 1, 0),
     "blender": (4, 1, 0),  # Compatible with Blender 4.1 and newer
     "location": "View3D > UI > Resize Empties",
