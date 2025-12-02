@@ -1,11 +1,11 @@
 bl_info = {
     "name": "Krutart Advanced Copy",
     "author": "iori, Krutart, Gemini",
-    "version": (2, 4, 6),
+    "version": (2, 6, 0), # Implements persistent 1-to-1 copy mapping
     "blender": (4, 2, 0),
     "location": "Outliner > Right-Click Menu, 3D View > 'N' Panel > Layout Suite",
-    "description": "Provides specific hierarchy traversal copy/move functionalities with dynamic, high-performance, shot-based collection visibility. Includes tools to toggle auto-visibility and manually control visibility states. Now with proper override support.",
-    "warning": "",
+    "description": "Provides specific hierarchy traversal copy/move functionalities with dynamic, high-performance, shot-based collection visibility. Correctly duplicates overrides (not-localize) and fixes visibility cache bugs from ENV/LOC operations.",
+    "warning": "This version uses a new persistent mapping system stored in a Text Block ('__krutart_copy_map.json').",
     "doc_url": "",
     "category": "Object",
 }
@@ -13,6 +13,7 @@ bl_info = {
 import bpy
 import re
 import logging
+import json # <-- ADDED for persistent mapping
 from bpy.props import StringProperty, BoolProperty
 from bpy.app.handlers import persistent
 
@@ -22,13 +23,66 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 log = logging.getLogger(__name__)
 
 
+# --- NEW: Persistent Copy Map Helpers (Phase 1) ---
+
+KRUTART_VISIBILITY_MAP_NAME = "__krutart_copy_map.json"
+
+def load_copy_map():
+    """
+    Loads the persistent copy map from the blend file's Text Blocks.
+    Returns a dictionary: { "shot_copy_name": "original_name", ... }
+    """
+    text_block = bpy.data.texts.get(KRUTART_VISIBILITY_MAP_NAME)
+    if not text_block:
+        return {}
+
+    json_data = text_block.as_string()
+    if not json_data:
+        return {}
+
+    try:
+        copy_map = json.loads(json_data)
+        if isinstance(copy_map, dict):
+            return copy_map
+        else:
+            log.warning(f"'{KRUTART_VISIBILITY_MAP_NAME}' does not contain a valid JSON object. Resetting map.")
+            return {}
+    except json.JSONDecodeError:
+        log.warning(f"Could not parse JSON from '{KRUTART_VISIBILITY_MAP_NAME}'. Resetting map.")
+        return {}
+
+def save_copy_map(copy_map_dict):
+    """
+    Saves the copy map dictionary back to the blend file's Text Blocks
+    as a JSON string.
+    """
+    try:
+        text_block = bpy.data.texts.get(KRUTART_VISIBILITY_MAP_NAME)
+        if not text_block:
+            text_block = bpy.data.texts.new(KRUTART_VISIBILITY_MAP_NAME)
+        
+        # This is critical to ensure the map saves with the .blend file
+        text_block.use_fake_user = True
+        
+        json_data = json.dumps(copy_map_dict, indent=2)
+        
+        text_block.clear()
+        text_block.write(json_data)
+        log.debug(f"Saved {len(copy_map_dict)} mappings to '{KRUTART_VISIBILITY_MAP_NAME}'.")
+
+    except Exception as e:
+        log.error(f"Failed to save copy map: {e}")
+
+# --- End of New Helpers ---
+
+
 # --- Shot Visibility Cache & Helpers ---
 # Global caches for performance.
 shot_switch_map = {} # Maps frame -> shot_id for timeline scrubbing.
 # Maps shot_id -> {set of original bpy.types.Object or .Collection instances}
 originals_to_hide_map = {}
-# Cache to quickly find original items by their base name.
-# Maps base_name -> bpy.types.Object or .Collection
+# Cache to quickly find original items by their full name.
+# Maps full_name_str -> bpy.types.Object or .Collection
 original_items_cache = {}
 cached_scene_name = None # Tracks the scene the cache was built for.
 
@@ -38,31 +92,14 @@ def get_shot_identifier(name):
     match = re.search(r"(SC\d+-SH\d+)", name, re.IGNORECASE)
     return match.group(1).upper() if match else None
 
-def get_base_name(item_name):
-    """
-    Extracts the base name from an item's name.
-    1. Strips shot suffixes (e.g., '-SC01-SH010').
-    2. Strips numeric suffixes (e.g., '.001').
-    Example: 'Cube.001-SC01-SH010' -> 'Cube'
-    Example: 'ACT-HAMSTER_SPACE-P-LOD1.001' -> 'ACT-HAMSTER_SPACE-P-LOD1'
-    Example: 'ACT-HAMSTER_SPACE-P-LOD1.003' -> 'ACT-HAMSTER_SPACE-P-LOD1'
-    """
-    if not item_name: return ""
-
-    # 1. Strip shot suffix (e.g., -SC##-SH###)
-    shot_match = re.search(r"(.+)-(SC\d+-SH\d+)$", item_name, re.IGNORECASE)
-    base_name = shot_match.group(1) if shot_match else item_name
-    
-    # 2. Strip numeric suffix (e.g., .001, .002)
-    # This regex finds a literal dot followed by 3 or more digits at the end of the string.
-    numeric_match = re.search(r"(.+)\.\d{3,}$", base_name)
-    base_name = numeric_match.group(1) if numeric_match else base_name
-    
-    return base_name
+# --- DELETED (Phase 4) ---
+# The problematic get_base_name function has been removed.
+# ---
 
 def get_all_shot_collections():
     """Scans the blend file for all collections matching the shot naming convention."""
-    pattern = re.compile(r"^(MODEL|CAM|VFX)-SC\d+-SH\d+$", re.IGNORECASE)
+    # --- MODIFIED --- Added 'PRP' to the pattern
+    pattern = re.compile(r"^(MODEL|CAM|VFX|PRP)-SC\d+-SH\d+$", re.IGNORECASE)
     return [c for c in bpy.data.collections if pattern.match(c.name)]
 
 def _collect_all_items_recursive(collection, collected_items_set):
@@ -95,11 +132,12 @@ def build_visibility_data(scene):
     """
     Builds all necessary caches for high-performance visibility updates.
     1. Scans timeline markers to map frames to shot IDs (shot_switch_map).
-    2. Scans shot collections to map which original items need to be hidden for each shot (originals_to_hide_map).
+    2. (NEW) Uses the persistent 1-to-1 copy map to determine which original items
+       need to be hidden for each shot (originals_to_hide_map).
     """
     global shot_switch_map, cached_scene_name, originals_to_hide_map, original_items_cache
     
-    # --- Part 1: Build Shot Switch Map (existing logic) ---
+    # --- Part 1: Build Shot Switch Map (existing logic, unchanged) ---
     shot_switch_map.clear()
     if not scene or not hasattr(scene, 'timeline_markers'):
         log.warning("build_visibility_data: Called with an invalid scene.")
@@ -115,72 +153,59 @@ def build_visibility_data(scene):
     cached_scene_name = scene.name
     log.info(f"Shot cache rebuilt for scene '{scene.name}'. Found {len(shot_switch_map)} switch frames.")
 
-    # --- Part 2: Build Original Items Visibility Map (MODIFIED logic) ---
+    # --- Part 2: Build Original Items Visibility Map (NEW LOGIC - Phase 4) ---
+    
     originals_to_hide_map.clear()
     original_items_cache.clear()
     
-    # --- MODIFICATION START ---
-    # Define "original" items as ALL items that are NOT inside a shot collection.
+    # 1. Load our persistent 1-to-1 map
+    # This map is {"shot_copy_name": "original_name", ...}
+    copy_map = load_copy_map()
+    if not copy_map:
+        log.warning("Visibility map is empty. No originals will be hidden.")
+        return
+
+    # 2. Build a simple cache of all data.blocks by their *full name*.
+    #    We only cache the *originals* we need, as defined in our map.
+    all_original_names = set(copy_map.values())
     
-    # 1. Find all shot collections
-    shot_coll_pattern = re.compile(r"^(MODEL|CAM|VFX)-SC\d+-SH\d+$", re.IGNORECASE)
-    all_shot_colls = {c for c in bpy.data.collections if shot_coll_pattern.match(c.name)}
+    for name in all_original_names:
+        item = bpy.data.objects.get(name) or bpy.data.collections.get(name)
+        if item:
+            original_items_cache[name] = item
+        else:
+            log.debug(f"Persistent map references original '{name}', but it's not in the scene. Will be ignored.")
 
-    # 2. Recursively find ALL items (objects and collections) that live inside any shot collection
-    items_in_shot_colls = set()
-    for shot_coll in all_shot_colls:
-        items_in_shot_colls.add(shot_coll) # Add the root shot collection itself
-        _collect_all_items_recursive(shot_coll, items_in_shot_colls)
-    
-    # 3. Define "all_original_items" as everything NOT in that set
-    all_original_items = set()
-    for item in bpy.data.objects:
-        if item not in items_in_shot_colls:
-            all_original_items.add(item)
-    for item in bpy.data.collections:
-        if item not in items_in_shot_colls:
-            all_original_items.add(item)
-
-    # 4. Cache all found original items by their *base name*
-    for item in all_original_items:
-        # Use the new, more robust get_base_name function
-        base_name = get_base_name(item.name)
-        if base_name not in original_items_cache:
-            original_items_cache[base_name] = item
-            log.debug(f"Cached original item '{item.name}' under base name '{base_name}'")
-    # --- MODIFICATION END ---
-
-    # --- This part remains the same, but now works with the new, more accurate cache ---
-    # Scan shot collections to find copies and link them to their originals.
+    # 3. Scan shot collections and map them to originals using our new map
     for shot_coll in get_all_shot_collections():
         coll_shot_id = get_shot_identifier(shot_coll.name)
         if not coll_shot_id:
             continue
-            
+        
         # Recursively find ALL items within this shot collection hierarchy.
-        # This will find nested objects and overridden collections.
         all_items_in_shot = set()
         _collect_all_items_recursive(shot_coll, all_items_in_shot)
         
         for shot_item in all_items_in_shot:
-            # Use the new, more robust get_base_name function
-            base_name = get_base_name(shot_item.name)
-            original_item = original_items_cache.get(base_name)
+            # Use our persistent map to find the original's name (1-to-1)
+            original_item_name = copy_map.get(shot_item.name)
             
-            if original_item:
-                if coll_shot_id not in originals_to_hide_map:
-                    originals_to_hide_map[coll_shot_id] = set()
+            if original_item_name:
+                # Find the original item from our new cache
+                original_item = original_items_cache.get(original_item_name)
                 
-                if original_item not in originals_to_hide_map[coll_shot_id]:
-                    originals_to_hide_map[coll_shot_id].add(original_item)
-                    log.debug(f"Linking shot item '{shot_item.name}' (base: '{base_name}') to original '{original_item.name}' for shot {coll_shot_id}")
+                if original_item:
+                    # We found a valid shot_item -> original_item link
+                    if coll_shot_id not in originals_to_hide_map:
+                        originals_to_hide_map[coll_shot_id] = set()
+                    
+                    if original_item not in originals_to_hide_map[coll_shot_id]:
+                        originals_to_hide_map[coll_shot_id].add(original_item)
+                        log.debug(f"Mapped shot item '{shot_item.name}' to original '{original_item.name}' for shot {coll_shot_id}")
+    
+    # --- End of New Logic ---
 
-                # --- FIX REMOVED ---
-                # The logic for handling overridden collection visibility is
-                # now correctly placed in set_item_visibility().
-    # --- END ---
-
-    log.info(f"Originals visibility map rebuilt. Found originals for {len(originals_to_hide_map)} shots. Cache size: {len(original_items_cache)} items.")
+    log.info(f"Originals visibility map rebuilt using persistent 1-to-1 map. Found originals for {len(originals_to_hide_map)} shots. Cache size: {len(original_items_cache)} items.")
 
 @persistent
 def build_visibility_data_on_load(dummy):
@@ -231,7 +256,7 @@ def set_item_visibility(view_layer, item, visible):
                 else:
                     # Keep debug log for regular collections
                     log.debug(f"Attempting to set exclude={new_exclude_state} on LayerCollection '{item.name}'")
-                    
+                        
             elif not layer_coll:
                 log.debug(f"Could not find a 'build' instance for collection '{item.name}' to hide/unhide.")
             # --- END MODIFIED LOGIC ---
@@ -308,32 +333,32 @@ def get_datablock_from_context(context):
     if hasattr(context, 'id') and context.id:
         item = context.id
         if isinstance(item, bpy.types.Collection):
-            log.info(f"Context target identified via context.id: Collection '{item.name}'")
+            log.debug(f"Context target identified via context.id: Collection '{item.name}'")
             return item, 'COLLECTION'
         if isinstance(item, bpy.types.Object):
-            log.info(f"Context target identified via context.id: Object '{item.name}'")
+            log.debug(f"Context target identified via context.id: Object '{item.name}'")
             return item, 'OBJECT'
 
     # 2. Check selected_ids, reliable for operator execution context after a click.
     if hasattr(context, 'selected_ids') and context.selected_ids:
         target_id = context.selected_ids[0]
         if isinstance(target_id, bpy.types.Collection):
-            log.info(f"Context target identified via selected_ids: Collection '{target_id.name}'")
+            log.debug(f"Context target identified via selected_ids: Collection '{target_id.name}'")
             return target_id, 'COLLECTION'
         if isinstance(target_id, bpy.types.Object):
-            log.info(f"Context target identified via selected_ids: Object '{target_id.name}'")
+            log.debug(f"Context target identified via selected_ids: Object '{target_id.name}'")
             return target_id, 'OBJECT'
 
     # 3. Fallback to active object.
     active_obj = context.active_object
     if active_obj:
-        log.info(f"Context target identified via active_object: '{active_obj.name}'")
+        log.debug(f"Context target identified via active_object: '{active_obj.name}'")
         return active_obj, 'OBJECT'
     
     # 4. Fallback to active collection in the Outliner.
     if context.view_layer and context.view_layer.active_layer_collection:
         active_coll = context.view_layer.active_layer_collection.collection
-        log.info(f"Context target identified via active_layer_collection: '{active_coll.name}'")
+        log.debug(f"Context target identified via active_layer_collection: '{active_coll.name}'")
         return active_coll, 'COLLECTION'
         
     # This log is commented out to prevent spamming the console when the cursor is over empty space.
@@ -342,101 +367,166 @@ def get_datablock_from_context(context):
 
 def copy_collection_hierarchy(original_coll, target_parent_coll, name_suffix=""):
     """
-    Recursively copies a collection and its contents, then remaps object relationships.
-    Handles overridden collections by simply duplicating them without deep-copying,
-    preventing localization.
+    Recursively performs a DEEP COPY (localization) or DUPLICATE (override)
+    of a collection and its contents, then remaps object relationships.
+    All copies preserve their original names.
+    
+    MODIFIED (Phase 2): Returns (top_level_new_coll, item_map)
+    item_map is a dict { orig_item: new_item } for ALL copied items (objects and collections)
     """
-    object_map = {}  # Maps original object -> new object
+    # MODIFIED (Phase 2): Renamed object_map to item_map
+    item_map = {}  # Maps original item -> new item (objects AND collections)
 
-    def _recursive_copy_and_map(source_coll, target_parent, suffix, obj_map):
-        # MODIFIED LOGIC: If the source collection is an override, just duplicate it,
-        # RENAME IT, and stop.
+    # --- MODIFICATION START (VERSION 2.5.3) ---
+    # This new helper function just *maps* an existing override hierarchy
+    # that was created by .copy(). It does *not* link anything.
+    def _map_copied_override_hierarchy(source_coll, new_coll, item_map): # MODIFIED: item_map
+        """
+        Recursively maps objects and collections from a source override hierarchy
+        to a new override hierarchy that was just created via .copy().
+        This is used to populate the item_map for relationship remapping.
+        """
+        # MODIFIED (Phase 2): Map collection itself and prevent re-mapping
+        if source_coll in item_map:
+            return # Already mapped
+        item_map[source_coll] = new_coll
+        log.debug(f"  Mapped orig coll '{source_coll.name}' to new '{new_coll.name}'")
+
+        # 1. Map objects
+        if len(source_coll.objects) == len(new_coll.objects):
+            for i, orig_obj in enumerate(source_coll.objects):
+                if orig_obj not in item_map:
+                    new_obj = new_coll.objects[i]
+                    item_map[orig_obj] = new_obj # MODIFIED: item_map
+                    log.debug(f"  Mapped orig obj '{orig_obj.name}' to new '{new_obj.name}'")
+        else:
+            log.warning(f"Object count mismatch in override map: '{source_coll.name}' ({len(source_coll.objects)}) vs '{new_coll.name}' ({len(new_coll.objects)}). Relationship remapping may fail.")
+            
+        # 2. Map child collections and recurse
+        if len(source_coll.children) == len(new_coll.children):
+            for i, orig_child_coll in enumerate(source_coll.children):
+                new_child_coll = new_coll.children[i]
+                # Recurse into the child hierarchy
+                # MODIFIED: pass item_map
+                _map_copied_override_hierarchy(orig_child_coll, new_child_coll, item_map)
+        else:
+             log.warning(f"Collection count mismatch in override map: '{source_coll.name}' ({len(source_coll.children)}) vs '{new_coll.name}' ({len(new_coll.children)}). Relationship remapping may fail.")
+    # --- END NEW HELPER ---
+
+    def _recursive_copy_and_map(source_coll, target_parent, suffix, item_map): # MODIFIED: item_map
+        # The 'suffix' parameter is no longer used, but kept for call signature.
+        
+        # --- MODIFICATION START (VERSION 2.5.3) ---
+        # Logic is now split. We handle overrides and regular collections differently.
+        
         if source_coll.override_library:
-            log.info(f"'{source_coll.name}' is an override. Duplicating as a new override.")
+            # --- This is an OVERRIDE ---
+            # Use source_coll.copy() to create a new, duplicate override.
+            # This single command copies the *entire* internal hierarchy.
+            log.debug(f"Copying '{source_coll.name}' as a new override.")
             new_coll = source_coll.copy()
             
-            # --- THIS IS THE FIX ---
-            # We MUST apply the suffix to the new override datablock.
-            # Use the base name of the original to create the new name.
-            new_coll.name = f"{get_base_name(source_coll.name)}{suffix}"
-            # --- END FIX ---
-
+            # 2. Link the new *top-level* collection to its new parent.
             target_parent.children.link(new_coll)
-            # Stop recursion for this branch. The override is treated as a single unit.
-            return new_coll
+            
+            # 3. FIX: Recursively *map* (don't copy/link) the entire
+            #    hierarchy that .copy() just created so we can remap
+            #    relationships later.
+            log.debug(f"Populating item map from new override hierarchy '{new_coll.name}'...")
+            # MODIFIED: pass item_map
+            _map_copied_override_hierarchy(source_coll, new_coll, item_map)
+            # We are DONE. We do not recurse further to link anything.
 
-        # --- Existing logic for regular (non-overridden) collections ---
-        
-        # 1. Create the new collection data-block.
-        new_coll_name = f"{get_base_name(source_coll.name)}{suffix}" # Use base name for new coll
-        new_coll = bpy.data.collections.new(new_coll_name)
+        else:
+            # --- This is a REGULAR, non-overridden collection ---
+            # Use the original deep-copy (localization) logic.
+            log.debug(f"Deep-copying '{source_coll.name}' as a new collection.")
+            new_coll_name = source_coll.name # Preserve name
+            new_coll = bpy.data.collections.new(new_coll_name)
+            
+            # MODIFIED (Phase 2): Map the collection itself
+            item_map[source_coll] = new_coll
 
-        # 2. Link the new collection to its new parent in the hierarchy.
-        target_parent.children.link(new_coll)
-        new_coll.color_tag = source_coll.color_tag
+            # 2. Link the new collection to its new parent in the hierarchy.
+            target_parent.children.link(new_coll)
+            new_coll.color_tag = source_coll.color_tag
+            
+            # 3. (Original Logic) Deep copy all objects from the source collection.
+            for obj in source_coll.objects:
+                if obj not in item_map: # MODIFIED: item_map
+                    new_obj = obj.copy()  # This correctly creates a new override if obj is one.
+                    if obj.data:
+                        # This also correctly creates a new override if data is one.
+                        new_obj.data = obj.data.copy()
 
-        # 3. Deep copy all objects from the source collection.
-        for obj in source_coll.objects:
-            if obj not in obj_map:
-                new_obj = obj.copy()  # This correctly creates a new override if obj is one.
-                if obj.data:
-                    # This also correctly creates a new override if data is one.
-                    new_obj.data = obj.data.copy()
+                    # --- THIS IS THE FIX ---
+                    # Preserve the original name for all objects.
+                    new_obj.name = obj.name  
+                    # --- END FIX ---
+                    
+                    item_map[obj] = new_obj  # MODIFIED: item_map. Store the mapping
 
-                if obj.override_library:
-                    new_obj.name = obj.name  # Preserve name for overridden objects
-                else:
-                    new_obj.name = f"{get_base_name(obj.name)}{suffix}" # Use base name
-                
-                obj_map[obj] = new_obj  # Store the mapping
+            # 4. (Original Logic) Link the newly created deep-copied objects to our new collection.
+            #    This is SAFE because new_coll is NOT an override.
+            for obj in source_coll.objects:
+                new_obj = item_map.get(obj) # MODIFIED: item_map
+                if new_obj and new_obj.name not in new_coll.objects:
+                    new_coll.objects.link(new_obj)
 
-        # 4. Link the newly created deep-copied objects to our new collection.
-        for obj in source_coll.objects:
-            new_obj = obj_map.get(obj)
-            if new_obj and new_obj.name not in new_coll.objects:
-                new_coll.objects.link(new_obj)
+            # 5. Recurse for all child collections.
+            #    This ONLY happens for regular (non-override) collections.
+            for child in source_coll.children:
+                # MODIFIED: pass item_map
+                _recursive_copy_and_map(child, new_coll, suffix, item_map)
 
-        # 5. Recurse for all child collections.
-        for child in source_coll.children:
-            _recursive_copy_and_map(child, new_coll, suffix, obj_map)
+        # --- END OF MODIFICATION (VERSION 2.5.3) ---
 
         return new_coll
+    # --- End of _recursive_copy_and_map helper function ---
 
-    def _remap_relationships(obj_map):
-        log.info(f"Remapping relationships for {len(obj_map)} copied objects...")
-        for orig_obj, new_obj in obj_map.items():
+    def _remap_relationships(item_map): # MODIFIED: item_map
+        log.info(f"Remapping relationships for {len(item_map)} copied items...")
+        # MODIFIED: Renamed loop variables
+        for orig_item, new_item in item_map.items():
+            
+            # MODIFIED (Phase 2): Skip collections, they don't have these properties
+            if not isinstance(new_item, bpy.types.Object):
+                continue
+            
             # Parent remapping
-            if orig_obj.parent and orig_obj.parent in obj_map:
-                new_obj.parent = obj_map[orig_obj.parent]
-                new_obj.parent_type = orig_obj.parent_type
-                if orig_obj.parent_type == 'BONE':
-                    new_obj.parent_bone = orig_obj.parent_bone
+            if orig_item.parent and orig_item.parent in item_map: # MODIFIED: item_map
+                new_item.parent = item_map[orig_item.parent] # MODIFIED: item_map
+                new_item.parent_type = orig_item.parent_type
+                if orig_item.parent_type == 'BONE':
+                    new_item.parent_bone = orig_item.parent_bone
 
             # Constraint target remapping
-            for constraint in new_obj.constraints:
-                if hasattr(constraint, 'target') and constraint.target and constraint.target in obj_map:
-                    constraint.target = obj_map[constraint.target]
+            for constraint in new_item.constraints:
+                if hasattr(constraint, 'target') and constraint.target and constraint.target in item_map: # MODIFIED: item_map
+                    constraint.target = item_map[constraint.target] # MODIFIED: item_map
                 
                 if hasattr(constraint, 'targets'):
                     for subtarget in constraint.targets:
-                        if subtarget.target and subtarget.target in obj_map:
-                            subtarget.target = obj_map[subtarget.target]
+                        if subtarget.target and subtarget.target in item_map: # MODIFIED: item_map
+                            subtarget.target = item_map[subtarget.target] # MODIFIED: item_map
 
             # Modifier target remapping
-            for modifier in new_obj.modifiers:
+            for modifier in new_item.modifiers:
                 mod_obj_props = ['object', 'target', 'source_object', 'camera', 'curve']
                 for prop in mod_obj_props:
                     if hasattr(modifier, prop):
                         mod_obj = getattr(modifier, prop)
-                        if mod_obj and mod_obj in obj_map:
-                            setattr(modifier, prop, obj_map[mod_obj])
+                        if mod_obj and mod_obj in item_map: # MODIFIED: item_map
+                            setattr(modifier, prop, item_map[mod_obj]) # MODIFIED: item_map
 
     # --- Main execution of the function ---
-    top_level_new_coll = _recursive_copy_and_map(original_coll, target_parent_coll, name_suffix, object_map)
-    _remap_relationships(object_map)
+    # MODIFIED: pass item_map
+    top_level_new_coll = _recursive_copy_and_map(original_coll, target_parent_coll, name_suffix, item_map)
+    _remap_relationships(item_map) # MODIFIED: pass item_map
     
     log.info("Hierarchy copy and remapping complete.")
-    return top_level_new_coll
+    # MODIFIED (Phase 2): Return both the new collection and the full item map
+    return top_level_new_coll, item_map
 
 def get_project_scenes():
     """Retrieves all scenes matching the 'SC##-' naming convention."""
@@ -451,7 +541,8 @@ def is_in_build_hierarchy(layer_coll):
     i.e., NOT part of a 'shot' hierarchy (MODEL-SC##-SH###, etc.).
     """
     # --- MODIFICATION START ---
-    shot_pattern = re.compile(r"^(MODEL|CAM|VFX)-SC\d+-SH\d+$", re.IGNORECASE)
+    # --- MODIFIED --- Added 'PRP' to the pattern
+    shot_pattern = re.compile(r"^(MODEL|CAM|VFX|PRP)-SC\d+-SH\d+$", re.IGNORECASE)
     current = layer_coll
     
     # Check self and parents
@@ -573,19 +664,47 @@ class ADVCOPY_OT_copy_to_shot(bpy.types.Operator):
 
         log.info(f"Copying '{datablock.name}' ({datablock_type}) to '{target_coll.name}'.")
         
-        shot_id = get_shot_identifier(target_coll.name)
-        name_suffix = f"-{shot_id}" if shot_id else "-copy"
+        # --- MODIFICATION START ---
+        # shot_id and name_suffix logic is REMOVED
+        # --- MODIFICATION END ---
 
         new_datablock = None
         if datablock_type == 'OBJECT':
             new_datablock = datablock.copy()
             if datablock.data: new_datablock.data = datablock.data.copy()
             
-            if not new_datablock.override_library:
-                new_datablock.name = f"{get_base_name(datablock.name)}{name_suffix}" # Use base name
+            # --- THIS IS THE FIX ---
+            new_datablock.name = datablock.name # Preserve name
+            # --- END FIX ---
+            
             target_coll.objects.link(new_datablock)
+            
+            # --- MODIFIED (Phase 3): Save 1-to-1 mapping ---
+            if new_datablock:
+                try:
+                    map_data = load_copy_map()
+                    map_data[new_datablock.name] = datablock.name
+                    save_copy_map(map_data)
+                except Exception as e:
+                    log.error(f"Failed to save copy map for object: {e}")
+            # --- End Modification ---
+
         elif datablock_type == 'COLLECTION':
-            new_datablock = copy_collection_hierarchy(datablock, target_coll, name_suffix)
+            # copy_collection_hierarchy now handles overrides correctly
+            # MODIFIED (Phase 3): Get hierarchy_map back
+            new_datablock, hierarchy_map = copy_collection_hierarchy(datablock, target_coll, "")
+
+            # --- MODIFIED (Phase 3): Save 1-to-1 mapping for ENTIRE hierarchy ---
+            if new_datablock and hierarchy_map:
+                try:
+                    map_data = load_copy_map()
+                    for orig_item, new_item in hierarchy_map.items():
+                        if new_item and orig_item: # Safety check
+                            map_data[new_item.name] = orig_item.name
+                    save_copy_map(map_data)
+                except Exception as e:
+                    log.error(f"Failed to save copy map for collection hierarchy: {e}")
+            # --- End Modification ---
 
         if not new_datablock:
             self.report({'ERROR'}, "Failed to create a copy.")
@@ -615,7 +734,15 @@ class ADVCOPY_OT_move_to_all_shots(bpy.types.Operator):
             self.report({'ERROR'}, "Could not determine the source collection.")
             return {'CANCELLED'}
         
-        prefix = "MODEL" if "MODEL" in source_collection.name else "VFX"
+        # --- MODIFIED --- Added 'PRP' logic
+        if "MODEL" in source_collection.name:
+            prefix = "MODEL"
+        elif "PRP" in source_collection.name:
+            prefix = "PRP"
+        else:
+            prefix = "VFX" # Keep original fallback
+        # --- END MODIFIED ---
+            
         shot_pattern = re.compile(rf"^{prefix}-SC\d+-SH\d+$", re.IGNORECASE)
         shot_collections = sorted([c for c in bpy.data.collections if shot_pattern.match(c.name)], key=lambda c: c.name)
 
@@ -624,24 +751,57 @@ class ADVCOPY_OT_move_to_all_shots(bpy.types.Operator):
             return {'CANCELLED'}
         
         copied_count = 0
+        # --- MODIFIED (Phase 3): Load map once before looping ---
+        try:
+            map_data = load_copy_map()
+        except Exception as e:
+            log.error(f"Failed to load copy map before move: {e}")
+            map_data = {}
+            
         for target_coll in shot_collections:
-            shot_id = get_shot_identifier(target_coll.name)
-            name_suffix = f"-{shot_id}" if shot_id else "-moved"
+            # --- MODIFICATION START ---
+            # shot_id and name_suffix logic is REMOVED
+            # --- MODIFICATION END ---
 
             new_datablock = None
             if datablock_type == 'OBJECT':
                 new_datablock = datablock.copy()
                 if datablock.data: new_datablock.data = datablock.data.copy()
-                if not new_datablock.override_library:
-                    new_datablock.name = f"{get_base_name(datablock_name)}{name_suffix}" # Use base name
+                
+                # --- THIS IS THE FIX ---
+                new_datablock.name = datablock_name # Preserve original name
+                # --- END FIX ---
+                
                 target_coll.objects.link(new_datablock)
+                
+                # --- MODIFIED (Phase 3): Add to map ---
+                if new_datablock:
+                    map_data[new_datablock.name] = datablock.name
+                # --- End Modification ---
+
             elif datablock_type == 'COLLECTION':
-                new_datablock = copy_collection_hierarchy(datablock, target_coll, name_suffix)
+                # copy_collection_hierarchy now handles overrides correctly
+                # MODIFIED (Phase 3): Get hierarchy_map back
+                new_datablock, hierarchy_map = copy_collection_hierarchy(datablock, target_coll, "")
+
+                # --- MODIFIED (Phase 3): Add ENTIRE hierarchy to map ---
+                if new_datablock and hierarchy_map:
+                    for orig_item, new_item in hierarchy_map.items():
+                        if new_item and orig_item: # Safety check
+                            map_data[new_item.name] = orig_item.name
+                # --- End Modification ---
             
             if not new_datablock: continue
             copied_count += 1
             
         if copied_count > 0:
+            # --- MODIFIED (Phase 3): Save map once after looping ---
+            try:
+                save_copy_map(map_data)
+            except Exception as e:
+                log.error(f"Failed to save copy map after move: {e}")
+            # --- End Modification ---
+
             log.info(f"Removing original datablock '{datablock_name}'")
             if datablock_type == 'OBJECT':
                 bpy.data.objects.remove(datablock, do_unlink=True)
@@ -669,8 +829,13 @@ class ADVCOPY_OT_move_to_all_scenes(bpy.types.Operator):
             return {'CANCELLED'}
 
         source_collection = get_source_collection(datablock)
-        if not source_collection or not (source_collection.name.startswith("MODEL-ENV") or source_collection.name.startswith("VFX-ENV")):
-            self.report({'ERROR'}, "Selected item must be in a 'MODEL-ENV...' or 'VFX-ENV...' collection.")
+        # --- MODIFIED --- Added 'PRP-ENV' check
+        if not source_collection or not (
+            source_collection.name.startswith("MODEL-ENV") or 
+            source_collection.name.startswith("VFX-ENV") or 
+            source_collection.name.startswith("PRP-ENV")
+        ):
+            self.report({'ERROR'}, "Selected item must be in a 'MODEL-ENV...', 'VFX-ENV...', or 'PRP-ENV...' collection.")
             return {'CANCELLED'}
         
         enviro_name_match = re.search(r"ENV-(.+)", source_collection.name, re.IGNORECASE)
@@ -679,7 +844,15 @@ class ADVCOPY_OT_move_to_all_scenes(bpy.types.Operator):
             return {'CANCELLED'}
         enviro_name = enviro_name_match.group(1)
         
-        prefix = "MODEL" if source_collection.name.startswith("MODEL") else "VFX"
+        # --- MODIFIED --- Added 'PRP' logic
+        if source_collection.name.startswith("MODEL"):
+            prefix = "MODEL"
+        elif source_collection.name.startswith("PRP"):
+            prefix = "PRP"
+        else:
+            prefix = "VFX" # Keep original fallback
+        # --- END MODIFIED ---
+            
         all_scenes = get_project_scenes()
         matching_scenes = [scene for scene in all_scenes if enviro_name in scene.name]
         
@@ -692,23 +865,31 @@ class ADVCOPY_OT_move_to_all_scenes(bpy.types.Operator):
             final_target_coll = None
             base_scene_coll = scene.collection.children.get(f"+{scene.name}+")
             if base_scene_coll:
-                parent_prefix = "ART" if prefix == "MODEL" else "VFX"
+                # --- MODIFIED --- Handle 'PRP' -> 'ART' mapping same as 'MODEL'
+                parent_prefix = "ART" if (prefix == "MODEL" or prefix == "PRP") else "VFX"
                 parent_coll = base_scene_coll.children.get(f"+{parent_prefix}-{scene.name}+")
                 if parent_coll:
                     final_target_coll = parent_coll.children.get(f"{prefix}-{scene.name}")
 
             if final_target_coll:
-                scene_suffix = scene.name.split('-')[0]
-                name_suffix = f"-{scene_suffix.upper()}"
+                # --- MODIFICATION START ---
+                # scene_suffix and name_suffix logic is REMOVED
+                # --- MODIFICATION END ---
+                
                 if datablock_type == 'OBJECT':
                     new_obj = datablock.copy()
                     if datablock.data:
                         new_obj.data = datablock.data.copy()
-                    if not new_obj.override_library:
-                        new_obj.name = f"{get_base_name(datablock.name)}{name_suffix}" # Use base name
+                        
+                    # --- THIS IS THE FIX ---
+                    new_obj.name = datablock.name # Preserve name
+                    # --- END FIX ---
+                    
                     final_target_coll.objects.link(new_obj)
                 elif datablock_type == 'COLLECTION':
-                    copy_collection_hierarchy(datablock, final_target_coll, name_suffix)
+                    # copy_collection_hierarchy now handles overrides correctly
+                    # This returns a map, but we DON'T save it, per user request.
+                    copy_collection_hierarchy(datablock, final_target_coll, "")
                 copied_count += 1
             else:
                 log.warning(f"Could not find target collection for '{prefix}' in scene '{scene.name}'.")
@@ -720,6 +901,12 @@ class ADVCOPY_OT_move_to_all_scenes(bpy.types.Operator):
             elif datablock_type == 'COLLECTION':
                 if datablock.name in source_collection.children:
                     source_collection.children.unlink(datablock)
+
+            # --- FIX 2: Rebuild cache after modifying build hierarchy ---
+            build_visibility_data(context.scene)
+            on_frame_change_update_visibility(context.scene)
+            # --- End of Fix ---
+
             self.report({'INFO'}, f"Moved '{datablock.name}' to {copied_count} matching scene(s).")
         else:
             self.report({'ERROR'}, "Could not find any valid target collections in matching scenes.")
@@ -738,11 +925,24 @@ class ADVCOPY_OT_copy_to_all_enviros(bpy.types.Operator):
             return {'CANCELLED'}
 
         source_collection = get_source_collection(datablock)
-        if not source_collection or not (source_collection.name.startswith("MODEL-LOC") or source_collection.name.startswith("VFX-LOC")):
-            self.report({'ERROR'}, "Selected item must be in a 'MODEL-LOC...' or 'VFX-LOC...' collection.")
+        # --- MODIFIED --- Added 'PRP-LOC' check
+        if not source_collection or not (
+            source_collection.name.startswith("MODEL-LOC") or 
+            source_collection.name.startswith("VFX-LOC") or
+            source_collection.name.startswith("PRP-LOC")
+        ):
+            self.report({'ERROR'}, "Selected item must be in a 'MODEL-LOC...', 'VFX-LOC...', or 'PRP-LOC...' collection.")
             return {'CANCELLED'}
         
-        prefix = "MODEL" if source_collection.name.startswith("MODEL") else "VFX"
+        # --- MODIFIED --- Added 'PRP' logic
+        if source_collection.name.startswith("MODEL"):
+            prefix = "MODEL"
+        elif source_collection.name.startswith("PRP"):
+            prefix = "PRP"
+        else:
+            prefix = "VFX" # Keep original fallback
+        # --- END MODIFIED ---
+            
         all_env_parent_collections = [c for c in bpy.data.collections if c.name.startswith("+ENV-")]
         if not all_env_parent_collections:
             self.report({'WARNING'}, "No parent '+ENV-...' collections found to copy to.")
@@ -755,25 +955,34 @@ class ADVCOPY_OT_copy_to_all_enviros(bpy.types.Operator):
             target_sub_coll = env_parent_coll.children.get(target_sub_coll_name)
             
             if target_sub_coll:
-                name_suffix = ""
-                env_name_suffix_match = re.search(r"ENV-(.+)", base_name, re.IGNORECASE)
-                if env_name_suffix_match:
-                    name_suffix = f"-{env_name_suffix_match.group(1)}"
+                # --- MODIFICATION START ---
+                # name_suffix and env_name_suffix_match logic is REMOVED
+                # --- MODIFICATION END ---
 
                 if datablock_type == 'OBJECT':
                     new_obj = datablock.copy()
                     if datablock.data:
                         new_obj.data = datablock.data.copy()
-                    if not new_obj.override_library:
-                        new_obj.name = f"{get_base_name(datablock.name)}{name_suffix}" # Use base name
+                        
+                    # --- THIS IS THE FIX ---
+                    new_obj.name = datablock.name # Preserve name
+                    # --- END FIX ---
+                    
                     target_sub_coll.objects.link(new_obj)
                 elif datablock_type == 'COLLECTION':
-                    copy_collection_hierarchy(datablock, target_sub_coll, name_suffix)
+                    # copy_collection_hierarchy now handles overrides correctly
+                    # This returns a map, but we DON'T save it, per user request.
+                    copy_collection_hierarchy(datablock, target_sub_coll, "")
                 copied_count += 1
             else:
                 log.warning(f"Could not find sub-collection '{target_sub_coll_name}' in '{env_parent_coll.name}'")
 
         if copied_count > 0:
+            # --- FIX 2: Rebuild cache after modifying build hierarchy ---
+            build_visibility_data(context.scene)
+            on_frame_change_update_visibility(context.scene)
+            # --- End of Fix ---
+
             self.report({'INFO'}, f"Copied '{datablock.name}' to {copied_count} environment collections.")
             if datablock_type == 'OBJECT':
                 if datablock.name in source_collection.objects:
@@ -860,7 +1069,15 @@ class ADVCOPY_MT_copy_to_shot_menu(bpy.types.Menu):
         
         current_scene_prefix = scene_match.group(1).upper()
         
-        prefix = "MODEL" if "MODEL" in source_collection.name else "VFX"
+        # --- MODIFIED --- Added 'PRP' logic
+        if "MODEL" in source_collection.name:
+            prefix = "MODEL"
+        elif "PRP" in source_collection.name:
+            prefix = "PRP"
+        else:
+            prefix = "VFX" # Keep original fallback
+        # --- END MODIFIED ---
+            
         shot_pattern = re.compile(rf"^{prefix}-SC\d+-SH\d+$", re.IGNORECASE)
         
         shot_collections = sorted(
@@ -896,9 +1113,10 @@ def add_context_menus(self, context):
 
     source_collection = get_source_collection(datablock)
     if source_collection:
-        if source_collection.name.startswith(("MODEL-ENV", "VFX-ENV")):
+        # --- MODIFIED --- Added 'PRP' checks
+        if source_collection.name.startswith(("MODEL-ENV", "VFX-ENV", "PRP-ENV")):
             layout.operator(ADVCOPY_OT_move_to_all_scenes.bl_idname, icon='SCENE_DATA')
-        if source_collection.name.startswith(("MODEL-LOC", "VFX-LOC")):
+        if source_collection.name.startswith(("MODEL-LOC", "VFX-LOC", "PRP-LOC")):
             layout.operator(ADVCOPY_OT_copy_to_all_enviros.bl_idname, icon='CON_TRANSLIKE')
     layout.separator()
 
@@ -1019,8 +1237,8 @@ def unregister():
     
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+        
 
 if __name__ == "__main__":
     register()
-
 

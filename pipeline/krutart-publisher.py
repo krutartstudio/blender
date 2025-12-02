@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "Krutart Auto-Publisher",
+    "name": "Krutart Publisher",
     "author": "iori, Krutart, Gemini",
-    "version": (1, 4, 1),
+    "version": (1, 4, 9),  # Updated version for this fix
     "blender": (4, 0, 0),
-    "location": "Properties > Output Properties > Krutart Auto-Publisher",
-    "description": "Streamlines incremental saving and hero file creation with detailed logging.",
+    "location": "Properties > Output Properties > Krutart Publisher",
+    "description": "Streamlines incremental saving and hero file creation with detailed logging. Requires comment for actions.",
     "warning": "",
     "doc_url": "",
     "category": "Output",
@@ -17,16 +17,10 @@ import logging
 import shutil
 
 # --- Logger Setup ---
-# Set up a dedicated logger for this addon to provide clear, detailed feedback.
+# Define logger at the module level
+# Configuration will be handled in register() to ensure it works on reload
 logger = logging.getLogger("KrutartAutoPublisher")
-logger.setLevel(logging.INFO)
-
-# Prevent adding multiple handlers on script reload to avoid duplicate logs.
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(levelname)s: %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+# ---
 
 # --- Helper Functions ---
 
@@ -123,6 +117,13 @@ class KRUTART_OT_save_increment(bpy.types.Operator):
         # Get comment
         comment = context.scene.krutart_comment.strip()
         
+        # --- MODIFIED: Check for comment ---
+        if not comment:
+            self.report({'ERROR'}, "Comment is required to save increment.")
+            logger.error("Save Increment failed: No comment provided.")
+            return {'CANCELLED'}
+        # --- END MODIFICATION ---
+        
         # Construct new filename
         # Conditionally add flags part only if it exists
         if flags:
@@ -130,14 +131,10 @@ class KRUTART_OT_save_increment(bpy.types.Operator):
         else:
             base_name = f"{project}-{asset}-{new_version_str}"
         
-        if comment:
-            # Sanitize comment for filename
-            sanitized_comment = re.sub(r'[^a-zA-Z0-9_-]', '_', comment)
-            new_filename = f"{base_name}-{sanitized_comment}.blend"
-            logger.info(f"Comment added: '{comment}', sanitized to '{sanitized_comment}'")
-        else:
-            new_filename = f"{base_name}.blend"
-            logger.info("No comment provided.")
+        # Sanitize comment for filename
+        sanitized_comment = re.sub(r'[^a-zA-Z0-9_-]', '_', comment)
+        new_filename = f"{base_name}-{sanitized_comment}.blend"
+        logger.info(f"Comment added: '{comment}', sanitized to '{sanitized_comment}'")
 
         # Ensure filename is lowercase
         new_filepath = os.path.join(directory, new_filename.lower())
@@ -149,7 +146,7 @@ class KRUTART_OT_save_increment(bpy.types.Operator):
             bpy.ops.wm.save_as_mainfile(filepath=new_filepath)
             self.report({'INFO'}, f"Saved and switched to: {os.path.basename(new_filepath)}")
             context.scene.krutart_comment = "" # Clear comment field after save
-            logger.info("File saved and opened successfully.")
+            logger.info(f"File saved and opened successfully: {new_filepath}")
         except Exception as e:
             self.report({'ERROR'}, f"Failed to save file: {e}")
             logger.error(f"An exception occurred during file save: {e}")
@@ -160,12 +157,12 @@ class KRUTART_OT_save_increment(bpy.types.Operator):
 class KRUTART_OT_make_hero(bpy.types.Operator):
     """Saves the current file, creates a 'hero' copy, then saves an incremented version of the work file."""
     bl_idname = "krutart.make_hero"
-    bl_label = "Increment and Make Hero"
+    bl_label = "Make hero"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         logger.info("-" * 50)
-        logger.info("Starting 'Increment and Make Hero' process...")
+        logger.info("Starting 'Make hero' process...")
 
         # --- Preliminary Checks ---
         current_filepath = get_current_filepath()
@@ -180,11 +177,25 @@ class KRUTART_OT_make_hero(bpy.types.Operator):
             logger.error("Make Hero failed: Could not parse filename.")
             return {'CANCELLED'}
 
+        # --- MODIFIED: Check for comment ---
+        comment = context.scene.krutart_comment.strip()
+        if not comment:
+            self.report({'ERROR'}, "Comment is required to make hero.")
+            logger.error("Make Hero failed: No comment provided.")
+            return {'CANCELLED'}
+        # --- END MODIFICATION ---
+
+        # Define hero_filepath here to make it available for the final report
+        hero_filepath = "[not saved]" # Initialize with a default/error string
+        # This will be used by Step 3, so we define it early
+        hero_asset_dir_path = "[not set]" 
+
         # --- Step 1: Normal save of current file ---
         try:
             logger.info(f"Step 1/4: Performing a normal save of the current file: {os.path.basename(current_filepath)}")
             bpy.ops.wm.save_mainfile()
             saved_work_filepath = get_current_filepath()
+            logger.info(f"Step 1/4: Successfully saved current file to: {saved_work_filepath}")
         except Exception as e:
             self.report({'ERROR'}, f"Failed to save current file: {e}")
             logger.error(f"An exception occurred during initial save: {e}", exc_info=True)
@@ -195,17 +206,17 @@ class KRUTART_OT_make_hero(bpy.types.Operator):
             logger.info(f"Step 2/4: Creating Hero file from: {os.path.basename(saved_work_filepath)}")
             work_dir = os.path.dirname(saved_work_filepath)
             
-            # Insecurity: This logic assumes that '-work' appears once in a meaningful
-            # place in the directory structure (e.g., '.../asset-name-work/').
-            # A path like '/path/to/project-work/asset-work/' could have the first
-            # instance replaced, which may not be what is intended.
-            hero_asset_dir_path = re.sub('-work', '-HERO', work_dir, flags=re.IGNORECASE)
+            # --- UPDATED LOGIC (v1.4.4) ---
+            # Remove the '$' anchor to replace ALL occurrences of '-work'
+            hero_asset_dir_path = re.sub(r'-work', '-HERO', work_dir, flags=re.IGNORECASE)
 
             if work_dir.lower() == hero_asset_dir_path.lower():
-                error_msg = "Could not find a '-work' directory in the path to convert to '-HERO'."
+                # Updated error message to be more specific
+                error_msg = "Could not find any '-work' directories in the path to convert to '-HERO'."
                 self.report({'ERROR'}, error_msg)
                 logger.error(f"{error_msg} Original path: {work_dir}")
                 return {'CANCELLED'}
+            # --- END UPDATED LOGIC ---
 
             logger.info(f"Transformed WORK path '{work_dir}' to HERO path '{hero_asset_dir_path}'")
 
@@ -230,25 +241,61 @@ class KRUTART_OT_make_hero(bpy.types.Operator):
             logger.critical(f"An unexpected error in Hero creation logic: {e}", exc_info=True)
             return {'CANCELLED'}
 
-        # --- Step 3: Copy blender_assets.cats.txt file ---
+        # --- Step 3: Failsafe copy of blender_assets.cats.txt (v1.4.9) ---
         try:
-            logger.info("Step 3/4: Attempting to copy 'blender_assets.cats.txt' file.")
-            work_dir = os.path.dirname(saved_work_filepath)
-            hero_dir = hero_asset_dir_path
+            logger.info("Step 3/4: Searching for 'blender_assets.cats.txt' in parent 'LIBRARY-WORK' folder...")
+            
+            # 1. Get current .blend directory
+            current_blend_dir = os.path.dirname(saved_work_filepath)
 
-            # Insecurity: This assumes 'blender_assets.cats.txt' exists in the same directory as the .blend file.
-            # If it's in a parent '...-work' directory or a central library, this path will fail.
-            # The logic is based on the request "copy blender_assets.cats.txt file from work path dir to hero path dir".
-            source_cats_file = os.path.join(work_dir, "blender_assets.cats.txt")
-            dest_cats_file = os.path.join(hero_dir, "blender_assets.cats.txt")
+            # 2. Find Source 'LIBRARY-WORK'
+            source_library_dir = None
+            temp_path = current_blend_dir
+            
+            # Limit search depth to 10 levels up to prevent infinite loops
+            for _ in range(10): 
+                # Check if the base folder name is 'library-work'
+                if os.path.basename(temp_path).lower() == 'library-work':
+                    source_library_dir = temp_path
+                    logger.info(f"Found 'LIBRARY-WORK' directory at: {source_library_dir}")
+                    break
+                
+                parent_path = os.path.dirname(temp_path)
+                if parent_path == temp_path: # We've hit the root (e.g., S:\)
+                    break
+                temp_path = parent_path
 
-            if os.path.exists(source_cats_file):
-                shutil.copy2(source_cats_file, dest_cats_file)
-                logger.info(f"Successfully copied '{source_cats_file}' to '{dest_cats_file}'.")
+            # 5. Failsafe Checks & Copy Logic
+            if not source_library_dir:
+                # This is a warning, not an error. The hero process can continue.
+                logger.warning("Step 3/4: Could not find a parent 'LIBRARY-WORK' directory. Skipping .cats.txt copy.")
+                self.report({'WARNING'}, "Could not find 'LIBRARY-WORK' folder. Skipping .cats.txt copy.")
             else:
-                logger.warning(f"Source file not found, skipping copy: {source_cats_file}")
-                self.report({'WARNING'}, "'blender_assets.cats.txt' not found, copy skipped.")
+                # 3. Define Source cats.txt Path
+                source_cats_file = os.path.join(source_library_dir, "blender_assets.cats.txt")
+                
+                if not os.path.exists(source_cats_file):
+                    # This is also a warning.
+                    logger.warning(f"Step 3/4: Found '{source_library_dir}' but 'blender_assets.cats.txt' is missing. Skipping copy.")
+                    self.report({'WARNING'}, "'blender_assets.cats.txt' not found in LIBRARY-WORK. Skipping copy.")
+                else:
+                    # 4. Define Destination cats.txt Path
+                    # We build the path cleanly: '.../LIBRARY-WORK' -> '.../LIBRARY-HERO'
+                    parent_of_library_work = os.path.dirname(source_library_dir)
+                    dest_library_dir = os.path.join(parent_of_library_work, 'LIBRARY-HERO')
+                    dest_cats_file = os.path.join(dest_library_dir, "blender_assets.cats.txt")
+                    
+                    logger.info(f"Source file: {source_cats_file}")
+                    logger.info(f"Destination file: {dest_cats_file}")
+
+                    # 5. Create Dest Dir & Copy
+                    os.makedirs(dest_library_dir, exist_ok=True)
+                    shutil.copy2(source_cats_file, dest_cats_file)
+                    logger.info(f"Successfully copied 'blender_assets.cats.txt' to '{dest_library_dir}'.")
+                    
         except Exception as e:
+            # Report as an error, but do not cancel the 'Make Hero' process,
+            # as the .cats.txt file is not critical.
             logger.error(f"Failed to copy 'blender_assets.cats.txt': {e}", exc_info=True)
             self.report({'ERROR'}, "Failed to copy 'blender_assets.cats.txt': See logs for details.")
             # This is not considered a critical failure, so the process continues.
@@ -261,7 +308,7 @@ class KRUTART_OT_make_hero(bpy.types.Operator):
             new_version_str = f"v{new_version:03d}"
             logger.info(f"Incrementing work file from v{version:03d} to {new_version_str}")
             
-            comment = context.scene.krutart_comment.strip()
+            # We already have the comment from the preliminary check
             
             # Conditionally add flags part only if it exists
             if flags:
@@ -269,13 +316,9 @@ class KRUTART_OT_make_hero(bpy.types.Operator):
             else:
                 base_name = f"{project}-{asset}-{new_version_str}"
             
-            if comment:
-                sanitized_comment = re.sub(r'[^a-zA-Z0-9_-]', '_', comment)
-                new_filename = f"{base_name}-{sanitized_comment}.blend"
-                logger.info(f"Comment added: '{comment}', sanitized to '{sanitized_comment}'")
-            else:
-                new_filename = f"{base_name}.blend"
-                logger.info("No comment provided.")
+            sanitized_comment = re.sub(r'[^a-zA-Z0-9_-]', '_', comment)
+            new_filename = f"{base_name}-{sanitized_comment}.blend"
+            logger.info(f"Comment added: '{comment}', sanitized to '{sanitized_comment}'")
 
             work_dir = os.path.dirname(saved_work_filepath)
             new_incremental_filepath = os.path.join(work_dir, new_filename.lower())
@@ -286,15 +329,17 @@ class KRUTART_OT_make_hero(bpy.types.Operator):
             bpy.ops.wm.save_as_mainfile(filepath=new_incremental_filepath)
             
             context.scene.krutart_comment = ""
-            logger.info("New incremental file saved and opened successfully.")
+            logger.info(f"New incremental file saved and opened successfully: {new_incremental_filepath}")
         except Exception as e:
             self.report({'ERROR'}, f"Failed to save incremental file: {e}")
             logger.error(f"An exception occurred during final incremental save: {e}", exc_info=True)
             return {'CANCELLED'}
 
         # --- Final Report ---
-        self.report({'INFO'}, f"Hero created, and work file incremented to {new_version_str}")
-        logger.info("'Increment and Make Hero' process completed successfully.")
+        hero_basename = os.path.basename(hero_filepath)
+        self.report({'INFO'}, f"Hero '{hero_basename}' created, and work file incremented to {new_version_str}")
+        logger.info(f"Hero file saved to: {hero_filepath}") # Redundant log, but ensures it's logged at the end
+        logger.info("'Make hero' process completed successfully.")
         logger.info("-" * 50)
         return {'FINISHED'}
 
@@ -307,6 +352,7 @@ class KRUTART_PT_autopublisher_panel(bpy.types.Panel):
     bl_space_type = 'PROPERTIES'
     bl_region_type = 'WINDOW'
     bl_context = "output"
+    bl_order = -1  # --- ADDED: This moves the panel to the top ---
 
     def draw(self, context):
         layout = self.layout
@@ -328,19 +374,30 @@ class KRUTART_PT_autopublisher_panel(bpy.types.Panel):
             box.label(text="Expected: PROJECT-ASSET-[flags]-v###.blend")
             return
             
-        # --- Save Increment Section ---
+        # --- MODIFIED: Unified Publishing Box ---
         box = layout.box()
-        box.label(text="Incremental Save", icon='FILE_NEW')
-        box.prop(scene, "krutart_comment", text="Comment")
-        box.operator(KRUTART_OT_save_increment.bl_idname)
+        box.label(text="Publishing Actions", icon='FILE_NEW')
         
-        layout.separator()
-
-        # --- Make Hero Section ---
-        box = layout.box()
-        box.label(text="Publish Hero", icon='OUTLINER_OB_ARMATURE')
-        # This operator now includes the incremental save step.
-        op = box.operator(KRUTART_OT_make_hero.bl_idname)
+        # Shared comment field at the top
+        box.prop(scene, "krutart_comment", text="Comment")
+        
+        # --- NEW: Check if comment is empty ---
+        comment = scene.krutart_comment.strip()
+        is_comment_empty = not comment
+        
+        # --- NEW: Create a row for the buttons ---
+        row = box.row()
+        
+        # --- NEW: Disable row if comment is empty ---
+        if is_comment_empty:
+            row.enabled = False
+            
+        # Add Save Increment button to the row
+        row.operator(KRUTART_OT_save_increment.bl_idname)
+        
+        # Add Make Hero button to the row
+        row.operator(KRUTART_OT_make_hero.bl_idname)
+        # --- END MODIFIED SECTION ---
 
 # --- Registration ---
 
@@ -351,7 +408,25 @@ classes = (
 )
 
 def register():
-    logger.info("Registering Krutart Auto-Publisher Addon v1.4.1")
+    # --- MODIFIED: Logger Setup ---
+    # We configure the logger here to ensure it's set up every time
+    # the addon is registered, which fixes issues with script reloading.
+    global logger
+    logger = logging.getLogger("KrutartAutoPublisher")
+    logger.setLevel(logging.INFO)
+
+    # Clear existing handlers to prevent duplicate logs on reload
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    # Add a fresh handler to print to the system console
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(levelname)s: %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    # --- End Logger Setup ---
+
+    logger.info("Registering Krutart Publisher Addon v1.4.9") # Bumped version
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.krutart_comment = bpy.props.StringProperty(
@@ -361,9 +436,21 @@ def register():
     )
 
 def unregister():
-    logger.info("Unregistering Krutart Auto-Publisher Addon")
+    # --- MODIFIED: Removed 'global logger' declaration ---
+    # The logger is defined at the module-level (global).
+    # We only need to access it here, not assign it, so 'global'
+    # is not needed and was causing the reload error.
+    logger.info("Unregistering Krutart Publisher Addon")
+
+    # --- ADDED: Logger Teardown ---
+    # Get the logger and clear its handlers
+    if 'logger' in globals() and logger and logger.hasHandlers():
+        logger.handlers.clear()
+    # --- End Logger Teardown ---
+
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+        # Changed from register_class to unregister_class
+        bpy.utils.unregister_class(cls) 
     del bpy.types.Scene.krutart_comment
 
 if __name__ == "__main__":
