@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Krutart bRender + Deadline",
     "author": "iori, Krutart, Gemini",
-    "version": (3, 7, 0), # Incremented version for Deadline Integration
+    "version": (3, 8, 2), # Incremented for Bug Fix (Restored Missing Operator)
     "blender": (4, 1, 0),
     "location": "3D View > Sidebar > bRender",
-    "description": "Prepares render files (30FPS/ProRes/10ms) and optionally submits to Deadline.",
+    "description": "Prepares render files (30FPS/ProRes/10ms) and submits to Deadline.",
     "warning": "CYCLES/10ms limit/Output: ProRes. Deadline requires deadlinecommand.",
     "doc_url": "",
     "category": "Sequencer",
@@ -17,6 +17,7 @@ import logging
 import sys
 import subprocess
 import tempfile
+from bpy.app.handlers import persistent
 
 # --- SETUP LOGGER ---
 log = logging.getLogger("bRender")
@@ -26,6 +27,24 @@ if not log.handlers:
     handler.setFormatter(formatter)
     log.addHandler(handler)
 log.setLevel(logging.INFO)
+
+# --- GLOBAL VARS FOR HANDLERS ---
+_last_scene_name = ""
+
+# --- PREFERENCES HELPER ---
+def get_prefs(context):
+    """
+    Helper to get addon preferences. 
+    Handles both installed addon case and text editor execution case.
+    """
+    try:
+        return context.preferences.addons[__name__].preferences
+    except:
+        # Fallback if running from text editor and __name__ doesn't match registered addon name
+        for addon_name, addon in context.preferences.addons.items():
+            if addon.preferences and hasattr(addon.preferences, "project_code"):
+                return addon.preferences
+        return None
 
 # --- CORE LOGIC ---
 
@@ -45,13 +64,18 @@ def _parse_name_components(context, shot_marker_name, source_scene_name):
     scene_number = shot_match.group(1)
     shot_number = shot_match.group(2)
 
-    # 2. From source scene (Expected format: "sc##-env_name" or "SC##_env_name")
+    # 2. From source scene
     env_match = re.search(r"sc\d+[-_](.+)", source_scene_name, re.IGNORECASE)
     env_name = env_match.group(1) if env_match else "env"
 
-    # 3. From scene properties
-    project_code = context.scene.brender_project_code
-    task = context.scene.brender_task
+    # 3. From Global Preferences
+    prefs = get_prefs(context)
+    if not prefs:
+        log.error("Could not access Addon Preferences.")
+        return None
+        
+    project_code = prefs.project_code
+    task = prefs.task
 
     components = {
         "project_code": project_code,
@@ -68,7 +92,6 @@ def _parse_name_components(context, shot_marker_name, source_scene_name):
 def _get_shot_timing(context, shot_marker):
     """
     Utility to get shot start, end, and duration.
-    Returns (shot_start_frame, shot_end_frame, shot_duration) or (None, None, None)
     """
     shot_markers = sorted(
         [m for m in context.scene.timeline_markers if re.match(r"CAM-SC\d+-SH\d+", m.name, re.IGNORECASE)],
@@ -107,12 +130,10 @@ def _get_scene_content_duration(source_scene):
         log.error("No source scene provided to get content duration.")
         return 0
 
-    log.info(f"Determining content duration for '{source_scene.name}'...")
     end_marker = source_scene.timeline_markers.get("END")
     scene_content_duration = 0
     if end_marker:
         scene_content_duration = end_marker.frame - 1
-        log.info(f"Found 'END' marker. Content duration set to: {scene_content_duration} frames.")
     else:
         scene_content_duration = source_scene.frame_end - source_scene.frame_start + 1
         log.warning(f"No 'END' marker found in '{source_scene.name}'. Defaulting to scene's full duration: {scene_content_duration} frames.")
@@ -127,14 +148,12 @@ def _get_scene_content_duration(source_scene):
 def _prepare_shot_in_current_file(context, shot_marker):
     """
     Prepares the 'render' scene for a given shot marker.
-    Returns (True, source_scene_object, name_components_dict) on success.
     """
     log.info(f"--- Starting preparation for shot: {shot_marker.name} ---")
 
-    # Store the original scene to return to it
     original_active_scene = context.window.scene
 
-    # Delete any pre-existing 'render' scene to avoid conflicts
+    # Delete any pre-existing 'render' scene
     existing_render_scene = bpy.data.scenes.get("render")
     if existing_render_scene:
         log.warning("Found existing 'render' scene. Removing it.")
@@ -148,18 +167,13 @@ def _prepare_shot_in_current_file(context, shot_marker):
     # Create a full copy of the currently active scene
     log.info(f"Creating a empty of the active scene '{original_active_scene.name}'.")
     bpy.ops.scene.new(type='EMPTY')
-    render_scene = context.window.scene # The new scene is now active
+    render_scene = context.window.scene 
     render_scene.name = "render"
     
-    # --- MODIFIED: Force 30 FPS (Standard) ---
-    log.info("Forcing FPS to 30 (Standard).")
+    # --- Force 30 FPS (Standard) ---
     render_scene.render.fps = 30
     render_scene.render.fps_base = 1.0
-    # --- END MODIFICATION ---
     
-    log.info(f"New scene 'render' created.")
-
-    # Switch back to the original scene to find markers, etc.
     context.window.scene = original_active_scene
 
     shot_name = shot_marker.name
@@ -171,30 +185,24 @@ def _prepare_shot_in_current_file(context, shot_marker):
 
     # --- 2. Find the source scene from the marker name ---
     source_scene = original_active_scene
-    log.info(f"Using active scene '{source_scene.name}' as the source.")
 
     if not source_scene or not source_scene.sequence_editor:
         log.error(f"Source scene '{source_scene.name}' has no VSE. Aborting.")
         return (False, None, None)
 
-    # --- START SCENE STRIP FIX (PLAN STEP 1) ---
-    # Find the intended duration of the scene's content
+    # --- START SCENE STRIP FIX ---
     scene_content_duration = _get_scene_content_duration(source_scene)
     if scene_content_duration <= 0:
         return (False, None, None)
 
     # --- 2.1. Bind FULLDOME cameras in the source scene ---
-    log.info(f"Binding FULLDOME cameras in '{source_scene.name}'...")
     try:
         context.window.scene = source_scene
-
         if hasattr(source_scene, 'shot_camera_toggle'):
             source_scene.shot_camera_toggle = 'FULLDOME'
-            log.info("Successfully set 'shot_camera_toggle' to FULLDOME.")
         else:
-            log.error("Cannot find 'shot_camera_toggle' property. Is 'layout_suite.py' (v3.0.1+) enabled?")
+            log.error("Cannot find 'shot_camera_toggle' property.")
             raise Exception("shot_camera_toggle property not found")
-
     except Exception as e:
         log.error(f"Failed to bind FULLDOME cameras: {e}")
         context.window.scene = original_active_scene
@@ -214,7 +222,7 @@ def _prepare_shot_in_current_file(context, shot_marker):
         scene_num_str = name_match.group(1).lower() # "sc17"
         shot_num_str = name_match.group(2).lower() # "sh130"
 
-    log.info(f"Attempt 1: Finding strips starting with name: '{shot_name_prefix}'...")
+    # Attempt 1: Prefix
     for strip in vse_source.sequences_all:
         if strip.name.startswith(shot_name_prefix):
             if strip.type == 'MOVIE' and not guide_video_strip:
@@ -224,8 +232,8 @@ def _prepare_shot_in_current_file(context, shot_marker):
         if guide_video_strip and guide_audio_strip:
             break
 
+    # Attempt 2: Substring
     if (not guide_video_strip or not guide_audio_strip) and scene_num_str and shot_num_str:
-        log.warning(f"Attempt 2: Finding strips containing '{scene_num_str}' AND '{shot_num_str}'...")
         for strip in vse_source.sequences_all:
             strip_name_lower = strip.name.lower()
             if scene_num_str in strip_name_lower and shot_num_str in strip_name_lower:
@@ -236,8 +244,8 @@ def _prepare_shot_in_current_file(context, shot_marker):
             if guide_video_strip and guide_audio_strip:
                 break
 
+    # Attempt 3: Frame
     if not guide_video_strip or not guide_audio_strip:
-        log.warning(f"Attempt 3 (Fallback): Falling back to frame search at frame {shot_start_frame}...")
         for strip in vse_source.sequences_all:
             if strip.frame_start == shot_start_frame:
                 if strip.type == 'MOVIE' and not guide_video_strip:
@@ -248,7 +256,6 @@ def _prepare_shot_in_current_file(context, shot_marker):
                 break
 
     # --- 4. Prepare the 'render' scene's VSE ---
-    log.info("Preparing 'render' scene VSE...")
     if not render_scene.sequence_editor:
         render_scene.sequence_editor_create()
 
@@ -312,9 +319,6 @@ def _prepare_shot_in_current_file(context, shot_marker):
         log.warning(f"Could not find FULLDOME camera named '{fulldome_camera_name}'.")
 
     # --- 7. Finalize render scene settings ---
-    log.info("Finalizing render scene settings.")
-
-    # --- NEW: Set engine to CYCLES, 10ms Limit, No Denoise ---
     log.info("Setting CYCLES: 1 sample, No Denoise, 10ms Time Limit.")
     render_scene.render.engine = 'CYCLES'
     
@@ -322,7 +326,7 @@ def _prepare_shot_in_current_file(context, shot_marker):
         render_scene.cycles.samples = 1
         render_scene.cycles.use_denoising = False
         render_scene.cycles.transparent_max_bounces = 1
-        render_scene.cycles.time_limit = 0.01 # 10ms render time limit
+        render_scene.cycles.time_limit = 0.01 
     else:
         render_scene.render.samples = 1
 
@@ -330,13 +334,11 @@ def _prepare_shot_in_current_file(context, shot_marker):
     render_scene.frame_end = shot_end_frame - 1
     render_scene.render.film_transparent = True
 
-    # --- NEW: Set Output to ProRes (Quicktime / FFMPEG) ---
+    # --- Set Output to ProRes (Quicktime / FFMPEG) ---
     log.info("Setting Output Format to FFMPEG / QUICKTIME / PRORES.")
     render_scene.render.image_settings.file_format = 'FFMPEG'
     render_scene.render.ffmpeg.format = 'QUICKTIME'
     render_scene.render.ffmpeg.codec = 'PRORES' 
-    # Note: Blender defaults to Standard ProRes. 'LT' requires specific ffmpeg tweaks not in standard API properties.
-    # --- END NEW ---
 
     # --- TASK 5 & 1: Parse names, determine file paths, set render output path ---
     name_components = _parse_name_components(context, shot_marker.name, source_scene.name)
@@ -355,8 +357,9 @@ def _prepare_shot_in_current_file(context, shot_marker):
     name_components['new_save_path'] = new_save_path
 
     try:
-        base_path = bpy.path.abspath(context.scene.brender_output_base)
-        target_sc_prefix = name_components['scene_number'].upper() # e.g. "SC17"
+        prefs = get_prefs(context)
+        base_path = bpy.path.abspath(prefs.output_base)
+        target_sc_prefix = name_components['scene_number'].upper() 
         
         found_scene_dir = None
         if os.path.exists(base_path):
@@ -380,13 +383,15 @@ def _prepare_shot_in_current_file(context, shot_marker):
 
         shot_dir_name = new_blend_filename_no_ext
         output_dir = os.path.join(scene_dir_path, shot_dir_name)
-        filename_prefix_with_hyphen = new_blend_filename_no_ext.lower() + "-"
-        render_filepath = os.path.join(output_dir, filename_prefix_with_hyphen)
+        
+        # --- Explicit .mov extension and Disable Blender Auto-Extension ---
+        final_filename_mov = new_blend_filename_no_ext.lower() + ".mov"
+        render_filepath = os.path.join(output_dir, final_filename_mov)
 
         render_scene.render.filepath = render_filepath
-        render_scene.render.use_file_extension = True 
+        render_scene.render.use_file_extension = False 
 
-        log.info(f"Set render output path to: {render_filepath}")
+        log.info(f"Set render output path to (Single File Mode): {render_filepath}")
 
     except Exception as e:
         log.error(f"Error setting render output path: {e}")
@@ -507,31 +512,49 @@ def _purge_orphans():
 
 # --- DEADLINE SUBMISSION HELPER ---
 
-def _submit_to_deadline(filepath, start_frame, end_frame, output_path, deadline_cmd):
+def _submit_to_deadline(context, filepath, start_frame, end_frame, output_path, deadline_cmd):
     """
-    Submits a specific blend file to Deadline via subprocess.
+    Submits a specific blend file to Deadline.
     """
     if not os.path.exists(deadline_cmd):
         log.error(f"Deadline executable not found at: {deadline_cmd}")
         return False
 
     job_name = os.path.basename(filepath)
+    
+    prefs = get_prefs(context)
+    batch_name = prefs.project_code if prefs else "bRender_Batch"
+    
     major = bpy.app.version[0]
     minor = bpy.app.version[1]
     blender_version = f"{major}.{minor}"
 
+    # --- SINGLE MACHINE LOGIC ---
+    total_frames = (end_frame - start_frame) + 1
+    chunk_size = total_frames + 5000 
+
+    # --- RETRIEVE UI SETTINGS ---
+    priority = context.scene.brender_deadline_priority
+    pool = context.scene.brender_deadline_pool
+    sec_pool = context.scene.brender_deadline_secondary_pool
+    group = context.scene.brender_deadline_group
+
     # Job Info
     job_info = [
         f"Name={job_name}",
-        f"BatchName={job_name}", # Groups under same batch if submitting multiple
+        f"BatchName={batch_name}",
         "Plugin=Blender",
         f"Frames={start_frame}-{end_frame}",
+        f"ChunkSize={chunk_size}",
+        f"Priority={priority}",
+        f"Pool={pool}",
+        f"SecondaryPool={sec_pool}",
+        f"Group={group}",
         f"OutputDirectory0={os.path.dirname(output_path)}",
-        f"OutputFilename0={os.path.basename(output_path)}",
-        "Priority=50"
+        f"OutputFilename0={os.path.basename(output_path)}", 
     ]
 
-    # Plugin Info - CRITICAL: Point SceneFile to the NEWLY SAVED file
+    # Plugin Info
     plugin_info = [
         f"SceneFile={filepath}",
         f"Version={blender_version}",
@@ -540,25 +563,35 @@ def _submit_to_deadline(filepath, start_frame, end_frame, output_path, deadline_
     ]
 
     try:
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".job") as j_file:
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".job", encoding='utf-8') as j_file:
             j_file.write("\n".join(job_info))
             j_job_path = j_file.name
         
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".job") as p_file:
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".job", encoding='utf-8') as p_file:
             p_file.write("\n".join(plugin_info))
             p_plugin_path = p_file.name
 
         log.info(f"Submitting {job_name} to Deadline...")
+        
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
         process = subprocess.Popen(
             [deadline_cmd, j_job_path, p_plugin_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            startupinfo=startupinfo
         )
         stdout, stderr = process.communicate()
 
-        os.remove(j_job_path)
-        os.remove(p_plugin_path)
+        try:
+            os.remove(j_job_path)
+            os.remove(p_plugin_path)
+        except:
+            pass
 
         if process.returncode == 0:
             log.info(f"Deadline Submission Successful: {stdout.strip()}")
@@ -588,52 +621,62 @@ class BRENDER_UL_shot_list(bpy.types.UIList):
             layout.label(text=item.display_name)
 
 
+# --- PREFERENCES PANEL ---
+class BRENDER_AddonPreferences(bpy.types.AddonPreferences):
+    bl_idname = __name__
+
+    project_code: bpy.props.StringProperty(
+        name="Project Code", default="3212")
+    task: bpy.props.StringProperty(
+        name="Task", default="layout_r")
+    output_base: bpy.props.StringProperty(
+        name="Render Output Base", 
+        default="S:\\3212-EDIT\\SOURCE\\LAYOUT_RENDER\\", 
+        subtype='DIR_PATH')
+    
+    # Default Deadline Command Path
+    default_deadline_path = r"C:\Program Files\Thinkbox\Deadline10\bin\deadlinecommand.exe"
+    if sys.platform == "darwin":
+        default_deadline_path = "/Applications/Thinkbox/Deadline10/Resources/deadlinecommand"
+    elif sys.platform == "linux":
+        default_deadline_path = "/opt/Thinkbox/Deadline10/bin/deadlinecommand"
+
+    deadline_path: bpy.props.StringProperty(
+        name="Deadline Command", 
+        default=default_deadline_path, 
+        subtype='FILE_PATH',
+        description="Path to deadlinecommand executable"
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        box = layout.box()
+        box.label(text="Global bRender Settings", icon="PREFERENCES")
+        box.prop(self, "project_code")
+        box.prop(self, "task")
+        box.prop(self, "output_base")
+        box.separator()
+        box.prop(self, "deadline_path")
+
+
 # --- OPERATORS ---
 
-class BRENDER_OT_prepare_active_shot(bpy.types.Operator):
-    bl_idname = "brender.prepare_active_shot"
-    bl_label = "Prepare Active Shot"
-    bl_description = "Creates and saves a prepared render file for the shot under the playhead"
-    bl_options = {"REGISTER"}
+class BRENDER_OT_select_all_shots(bpy.types.Operator):
+    bl_idname = "brender.select_all_shots"
+    bl_label = "Select All"
+    bl_description = "Select or Deselect all shots"
+    
+    action: bpy.props.EnumProperty(
+        items=[('SELECT', "Select", ""), ('DESELECT', "Deselect", "")],
+        default='SELECT'
+    )
 
     def execute(self, context):
-        original_scene = context.window.scene
-
-        if not bpy.data.is_saved:
-            self.report({"ERROR"}, "Please save the main project file first.")
-            return {"CANCELLED"}
-
-        shot_info = get_shot_info_from_frame(context)
-        if not shot_info:
-            self.report({"ERROR"}, "No active shot marker found at the current frame.")
-            return {"CANCELLED"}
-
-        shot_marker = shot_info["shot_marker"]
-        log.info(f"Preparing active shot: {shot_marker.name}")
-
-        success, source_scene, name_components = _prepare_shot_in_current_file(context, shot_marker)
-        if not success:
-            self.report({"ERROR"}, f"Failed to prepare render scene for {shot_marker.name}.")
-            context.window.scene = original_scene
-            return {"CANCELLED"}
-
-        _purge_orphans()
-
-        new_filepath = name_components.get('new_save_path')
-
-        if new_filepath:
-            log.info(f"Saving prepared file to: {new_filepath}")
-            bpy.ops.wm.save_as_mainfile(filepath=new_filepath, copy=True)
-            self.report({'INFO'}, f"Saved: {os.path.basename(new_filepath)}")
-        else:
-            self.report({"ERROR"}, f"Could not generate a valid filename for '{shot_marker.name}'.")
-            context.window.scene = original_scene
-            return {"CANCELLED"}
-
-        context.window.scene = original_scene
-        log.info("Preparation for active shot complete.")
+        for shot in context.scene.brender_shot_list:
+            shot.is_selected = (self.action == 'SELECT')
         return {'FINISHED'}
 
+# --- RESTORED OPERATOR (Fixes NameError) ---
 class BRENDER_OT_prepare_this_file(bpy.types.Operator):
     bl_idname = "brender.prepare_this_file"
     bl_label = "Prepare This File"
@@ -698,26 +741,66 @@ class BRENDER_OT_refresh_shot_list(bpy.types.Operator):
         log.info(f"Found and listed {len(found_shots)} shots.")
         return {'FINISHED'}
 
+class BRENDER_OT_prepare_active_shot(bpy.types.Operator):
+    bl_idname = "brender.prepare_active_shot"
+    bl_label = "Prepare Active Shot"
+    bl_description = "Creates and saves a prepared render file for the shot under the playhead"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        original_scene = context.window.scene
+        if not bpy.data.is_saved:
+            self.report({"ERROR"}, "Please save the main project file first.")
+            return {"CANCELLED"}
+
+        shot_info = get_shot_info_from_frame(context)
+        if not shot_info:
+            self.report({"ERROR"}, "No active shot marker found at the current frame.")
+            return {"CANCELLED"}
+
+        shot_marker = shot_info["shot_marker"]
+        log.info(f"Preparing active shot: {shot_marker.name}")
+
+        success, source_scene, name_components = _prepare_shot_in_current_file(context, shot_marker)
+        if not success:
+            self.report({"ERROR"}, f"Failed to prepare render scene for {shot_marker.name}.")
+            context.window.scene = original_scene
+            return {"CANCELLED"}
+
+        _purge_orphans()
+        new_filepath = name_components.get('new_save_path')
+
+        if new_filepath:
+            log.info(f"Saving prepared file to: {new_filepath}")
+            bpy.ops.wm.save_as_mainfile(filepath=new_filepath, copy=True)
+            self.report({'INFO'}, f"Saved: {os.path.basename(new_filepath)}")
+        else:
+            self.report({"ERROR"}, f"Could not generate a valid filename for '{shot_marker.name}'.")
+            context.window.scene = original_scene
+            return {"CANCELLED"}
+
+        context.window.scene = original_scene
+        log.info("Preparation for active shot complete.")
+        return {'FINISHED'}
 
 class BRENDER_OT_prepare_render_batch(bpy.types.Operator):
     bl_idname = "brender.prepare_render_batch"
     bl_label = "Prepare Batch From Selection"
-    bl_description = "For each selected shot, prepares a render scene and saves a new .blend file. Optionally sends to Deadline."
+    bl_description = "Prepares render scenes for selected shots and submits to Deadline."
 
     def execute(self, context):
         if not bpy.data.is_saved:
             self.report({"ERROR"}, "Please save the main project file first.")
             return {"CANCELLED"}
 
-        # --- SAFETY SAVE: Save the master file state before processing ---
         bpy.ops.wm.save_mainfile()
         log.info("Master file saved successfully before batch processing.")
-        # ----------------------------------------------------------------
 
         original_scene = context.window.scene
-        # Cache Deadline settings
-        use_deadline = context.scene.brender_use_deadline
-        deadline_cmd = context.scene.brender_deadline_path
+        
+        # Access global preferences
+        prefs = get_prefs(context)
+        deadline_cmd = prefs.deadline_path if prefs else ""
 
         selected_shots = [s for s in context.scene.brender_shot_list if s.is_selected]
         if not selected_shots:
@@ -751,17 +834,15 @@ class BRENDER_OT_prepare_render_batch(bpy.types.Operator):
                 log.info(f"Saving prepared shot to: {new_filepath}")
                 bpy.ops.wm.save_as_mainfile(filepath=new_filepath, copy=True)
                 
-                # --- DEADLINE INTEGRATION ---
-                if use_deadline:
-                    # Retrieve details from the ACTIVE render scene before we switch back
-                    render_scene = context.window.scene 
-                    start_frame = render_scene.frame_start
-                    end_frame = render_scene.frame_end
-                    output_path = render_scene.render.filepath
+                # --- ALWAYS SUBMIT TO DEADLINE ---
+                render_scene = context.window.scene 
+                start_frame = render_scene.frame_start
+                end_frame = render_scene.frame_end
+                output_path = render_scene.render.filepath
 
-                    submit_success = _submit_to_deadline(new_filepath, start_frame, end_frame, output_path, deadline_cmd)
-                    if submit_success:
-                        submitted_count += 1
+                submit_success = _submit_to_deadline(context, new_filepath, start_frame, end_frame, output_path, deadline_cmd)
+                if submit_success:
+                    submitted_count += 1
                 # -----------------------------
 
                 shot_item.is_selected = False
@@ -771,11 +852,8 @@ class BRENDER_OT_prepare_render_batch(bpy.types.Operator):
 
             context.window.scene = original_scene
 
-        # Final cleanup: Ensure original scene is active and Remove the temp render scene
         context.window.scene = original_scene
         
-        # --- NEW: CLEANUP (REVERT) ---
-        # Remove the "render" scene used for generation to keep the current file clean
         temp_render = bpy.data.scenes.get("render")
         if temp_render:
             try:
@@ -783,19 +861,132 @@ class BRENDER_OT_prepare_render_batch(bpy.types.Operator):
                 log.info("Cleaned up temporary 'render' scene.")
             except Exception as e:
                 log.error(f"Error cleaning up 'render' scene: {e}")
-        # --- END NEW ---
 
-        msg = f"Batch complete. Saved {processed_count} files."
-        if use_deadline:
-            msg += f" Submitted {submitted_count} to Deadline."
-        
+        msg = f"Batch complete. Saved {processed_count} files. Submitted {submitted_count} to Deadline."
         log.info(f"--- {msg} ---")
         self.report({'INFO'}, msg)
 
         return {'FINISHED'}
 
 
-# --- DEBUG OPERATORS ---
+# --- HANDLERS (AUTO-REFRESH) ---
+
+@persistent
+def auto_refresh_shot_list(dummy):
+    """
+    Handler that refreshes the shot list when:
+    1. A file is loaded (load_post)
+    2. The scene changes (depsgraph_update_post check)
+    """
+    global _last_scene_name
+    
+    # Safety: check if context is valid
+    if not bpy.context or not bpy.context.scene:
+        return
+
+    current_scene_name = bpy.context.scene.name
+
+    # Only run refresh if scene name has changed (swapped scene) or forced
+    # Note: 'dummy' is None for load_post, but has value for depsgraph
+    is_load_post = dummy is None
+    
+    if is_load_post or current_scene_name != _last_scene_name:
+        _last_scene_name = current_scene_name
+        
+        # Don't refresh during rendering or animation playback to avoid stutter
+        if bpy.context.screen.is_animation_playing:
+            return
+
+        # Trigger refresh logic directly (avoiding operator call to prevent Undo stack push)
+        shot_list = bpy.context.scene.brender_shot_list
+        shot_list.clear()
+        found_shots = get_all_shots(bpy.context)
+        for marker in found_shots:
+            item = shot_list.add()
+            item.name = marker.name
+            name_match = re.match(r"CAM-(SC\d+-SH\d+)", marker.name, re.IGNORECASE)
+            if name_match:
+                item.display_name = name_match.group(1)
+            else:
+                item.display_name = marker.name 
+            item.frame = marker.frame
+        
+        log.info(f"Auto-refreshed shot list for scene: {current_scene_name}")
+
+
+# --- UI PANEL ---
+
+class VIEW3D_PT_brender_panel(bpy.types.Panel):
+    bl_label = "bRender"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "bRender"
+    bl_order = 0 
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        
+        # Global Settings Link
+        box = layout.box()
+        box.label(text="Global Settings", icon="PREFERENCES")
+        row = box.row()
+        row.label(text="Use Add-on Preferences to set Project Code & Output.")
+        row.operator("screen.userpref_show", text="Open Preferences", icon="SETTINGS")
+
+        layout.separator()
+
+        box = layout.box()
+        row = box.row(align=True)
+        row.label(text="Batch Shot Preparation", icon="FILE_TICK")
+        row.operator(BRENDER_OT_refresh_shot_list.bl_idname, text="", icon="FILE_REFRESH")
+        
+        # Select All / Deselect All
+        row = box.row(align=True)
+        row.alignment = 'RIGHT'
+        op_sel = row.operator(BRENDER_OT_select_all_shots.bl_idname, text="", icon="CHECKBOX_HLT")
+        op_sel.action = 'SELECT'
+        op_desel = row.operator(BRENDER_OT_select_all_shots.bl_idname, text="", icon="CHECKBOX_DEHLT")
+        op_desel.action = 'DESELECT'
+
+        shot_list = context.scene.brender_shot_list
+        if shot_list:
+            display_height = min(len(shot_list), 10)
+            display_height = max(3, display_height) 
+            box.template_list(
+                "BRENDER_UL_shot_list", "", 
+                scene, "brender_shot_list", 
+                scene, "brender_active_shot_index", 
+                rows=display_height
+            )
+            
+            box.separator()
+            
+            # --- COLLAPSIBLE FARM SETTINGS ---
+            box_farm = box.box()
+            row = box_farm.row()
+            row.prop(scene, "brender_show_farm_settings", 
+                icon="TRIA_DOWN" if scene.brender_show_farm_settings else "TRIA_RIGHT", 
+                icon_only=True, emboss=False
+            )
+            row.label(text="Farm Settings (Deadline)", icon="NETWORK_DRIVE")
+            
+            if scene.brender_show_farm_settings:
+                d_col = box_farm.column(align=True)
+                d_col.prop(scene, "brender_deadline_pool")
+                d_col.prop(scene, "brender_deadline_secondary_pool")
+                d_col.prop(scene, "brender_deadline_group")
+                d_col.prop(scene, "brender_deadline_priority")
+            # ---------------------------------
+
+            row = box.row()
+            row.operator(BRENDER_OT_prepare_render_batch.bl_idname, icon="EXPORT", text="Send to render")
+
+        else:
+            box.label(text="No shots found. Refresh or check markers.", icon="INFO")
+
+
+# --- DEBUG OPERATORS & PANEL ---
 
 class BRENDER_OT_debug_set_shot(bpy.types.Operator):
     bl_idname = "brender.debug_set_shot"
@@ -832,10 +1023,9 @@ class BRENDER_OT_debug_step_1_create_scene(bpy.types.Operator):
         render_scene = context.window.scene
         render_scene.name = "render"
         
-        # --- MODIFIED: Force 30 FPS (Standard) ---
+        # --- Force 30 FPS (Standard) ---
         render_scene.render.fps = 30
         render_scene.render.fps_base = 1.0
-        # --- END MODIFICATION ---
 
         context.window.scene = original_active_scene
         scene.brender_debug_status_message = "OK (Step 1): 'render' scene created & FPS set to 30."
@@ -915,7 +1105,7 @@ class BRENDER_OT_debug_step_4_add_strips(bpy.types.Operator):
             return {"CANCELLED"}
 
         guide_video_strip, guide_audio_strip = None, None
-        shot_name_prefix = shot_marker.name # e.g., "CAM-SC17-SH130"
+        shot_name_prefix = shot_marker.name 
 
         scene_num_str, shot_num_str = "", ""
         name_match = re.match(r"CAM-(SC\d+)-(SH\d+)", shot_marker.name, re.IGNORECASE)
@@ -928,10 +1118,8 @@ class BRENDER_OT_debug_step_4_add_strips(bpy.types.Operator):
             if strip.name.startswith(shot_name_prefix):
                 if strip.type == 'MOVIE' and not guide_video_strip:
                     guide_video_strip = strip
-                    log.info(f"  Debug: Found guide video (by prefix name): '{strip.name}'")
                 if strip.type == 'SOUND' and not guide_audio_strip:
                     guide_audio_strip = strip
-                    log.info(f"  Debug: Found guide audio (by prefix name): '{strip.name}'")
             if guide_video_strip and guide_audio_strip:
                 break 
 
@@ -942,23 +1130,19 @@ class BRENDER_OT_debug_step_4_add_strips(bpy.types.Operator):
                 if scene_num_str in strip_name_lower and shot_num_str in strip_name_lower:
                     if strip.type == 'MOVIE' and not guide_video_strip:
                         guide_video_strip = strip
-                        log.info(f"  Debug: Found guide video (by substring): '{strip.name}'")
                     if strip.type == 'SOUND' and not guide_audio_strip:
                         guide_audio_strip = strip
-                        log.info(f"  Debug: Found guide audio (by substring): '{strip.name}'")
                 if guide_video_strip and guide_audio_strip:
                     break 
 
         if not guide_video_strip or not guide_audio_strip:
-            log.warning(f"Debug Attempt 1 & 2 (by name/substring) failed. Attempt 3 (Fallback): Falling back to frame search at frame {shot_start_frame}...")
+            log.warning(f"Debug Attempt 1 & 2 failed. Attempt 3 (Fallback): Falling back to frame search at frame {shot_start_frame}...")
             for strip in vse_source.sequences_all:
                 if strip.frame_start == shot_start_frame:
                     if strip.type == 'MOVIE' and not guide_video_strip:
                         guide_video_strip = strip
-                        log.info(f"  Debug: Found guide video (by frame): '{strip.name}'")
                     if strip.type == 'SOUND' and not guide_audio_strip:
                         guide_audio_strip = strip
-                        log.info(f"  Debug: Found guide audio (by frame): '{strip.name}'")
                 if guide_video_strip and guide_audio_strip:
                     break 
 
@@ -983,17 +1167,13 @@ class BRENDER_OT_debug_step_4_add_strips(bpy.types.Operator):
             new_audio.frame_final_duration = shot_duration
             new_audio.frame_offset_start = 0
             new_audio.volume = 0.8
-            log.info("Debug: Added audio strip.")
-        else:
-            log.warning("Debug: No guide audio strip found.")
-
+        
         shot_scene_strip = vse_render.sequences.new_scene(
             name=shot_name, scene=source_scene,
             channel=2, frame_start=shot_start_frame)
         shot_scene_strip.frame_final_duration = scene_content_duration
         shot_scene_strip.scene_input = 'CAMERA'
         shot_scene_strip.animation_offset_start = 1 - source_scene.frame_start
-        log.info("Debug: Added scene strip.")
 
         if guide_video_strip:
             new_video = vse_render.sequences.new_movie(
@@ -1007,7 +1187,6 @@ class BRENDER_OT_debug_step_4_add_strips(bpy.types.Operator):
             if hasattr(new_video, 'sound') and new_video.sound: new_video.sound.volume = 0
             
             # Hardcoded Transform, Crop & Green Mask
-            log.info("Debug: Applying hardcoded transform and crop to guide video.")
             new_video.transform.scale_x = 2
             new_video.transform.scale_y = 2
             new_video.transform.offset_x = -156
@@ -1015,15 +1194,11 @@ class BRENDER_OT_debug_step_4_add_strips(bpy.types.Operator):
             new_video.crop.max_x = 608
             new_video.crop.min_y = 403
             
-            log.info("Debug: Adding Green Color Balance modifier.")
             mod = new_video.modifiers.new(name="GreenMask", type='COLOR_BALANCE')
             mod.color_balance.lift = [0, 1, 0]
             mod.color_balance.gamma = [0, 1, 0]
             mod.color_balance.gain = [0, 1, 0]
             
-        else:
-            log.warning("Debug: No guide video strip found.")
-
         added_count = 1 
         missing_strips = []
         if guide_audio_strip: added_count += 1
@@ -1034,14 +1209,11 @@ class BRENDER_OT_debug_step_4_add_strips(bpy.types.Operator):
 
         if not missing_strips:
             msg = f"OK (Step 4): Added all {added_count} strips (Scene, Audio, Video w/ Green Mask)."
-            log.info(msg)
         else:
             missing_str = " & ".join(missing_strips)
             msg = f"WARNING (Step 4): Added Scene strip, but MISSING guide {missing_str}."
-            log.warning(f"Debug: {msg}")
 
         scene.brender_debug_status_message = msg
-        log.info("--- DEBUG STEP 4: Complete ---")
         return {'FINISHED'}
 
 class BRENDER_OT_debug_step_5_set_scene_settings(bpy.types.Operator):
@@ -1110,7 +1282,9 @@ class BRENDER_OT_debug_step_6_set_render_path(bpy.types.Operator):
             return {"CANCELLED"}
 
         try:
-            base_path = bpy.path.abspath(context.scene.brender_output_base)
+            # UPDATED: Use Global Prefs
+            prefs = get_prefs(context)
+            base_path = bpy.path.abspath(prefs.output_base)
             target_sc_prefix = name_components['scene_number'].upper() # "SC17"
             
             found_scene_dir = None
@@ -1131,11 +1305,11 @@ class BRENDER_OT_debug_step_6_set_render_path(bpy.types.Operator):
             shot_dir_name = new_blend_filename_no_ext
             output_dir = os.path.join(scene_dir_path, shot_dir_name)
 
-            filename_prefix_with_hyphen = new_blend_filename_no_ext.lower() + "-"
-            render_filepath = os.path.join(output_dir, filename_prefix_with_hyphen)
+            final_filename_mov = new_blend_filename_no_ext.lower() + ".mov"
+            render_filepath = os.path.join(output_dir, final_filename_mov)
 
             render_scene.render.filepath = render_filepath
-            render_scene.render.use_file_extension = True
+            render_scene.render.use_file_extension = False 
 
             msg = f"OK (Step 6): Set render path to: {render_filepath}"
             log.info(msg)
@@ -1203,61 +1377,6 @@ class BRENDER_OT_debug_step_8_set_active(bpy.types.Operator):
             context.window.scene = render_scene
         return {'FINISHED'}
 
-
-# --- UI PANEL ---
-
-class VIEW3D_PT_brender_panel(bpy.types.Panel):
-    bl_label = "bRender"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "bRender"
-    bl_order = 0 
-
-    def draw(self, context):
-        layout = self.layout
-        scene = context.scene
-
-        box = layout.box()
-        box.label(text="Settings", icon="TOOL_SETTINGS")
-        col = box.column(align=True)
-        col.prop(scene, "brender_project_code")
-        col.prop(scene, "brender_task")
-        col.prop(scene, "brender_output_base")
-
-        layout.separator()
-
-        box = layout.box()
-        row = box.row(align=True)
-        row.label(text="Batch Shot Preparation", icon="FILE_TICK")
-        row.operator(BRENDER_OT_refresh_shot_list.bl_idname, text="", icon="FILE_REFRESH")
-
-        shot_list = context.scene.brender_shot_list
-        if shot_list:
-            display_height = min(len(shot_list), 10)
-            display_height = max(3, display_height) 
-            box.template_list(
-                "BRENDER_UL_shot_list", "", 
-                scene, "brender_shot_list", 
-                scene, "brender_active_shot_index", 
-                rows=display_height
-            )
-            
-            # --- DEADLINE TOGGLE ---
-            box.separator()
-            row = box.row()
-            row.prop(scene, "brender_use_deadline", text="Submit to Deadline")
-            
-            if scene.brender_use_deadline:
-                row = box.row()
-                row.prop(scene, "brender_deadline_path", text="")
-            # -----------------------
-
-            row = box.row()
-            row.operator(BRENDER_OT_prepare_render_batch.bl_idname, icon="EXPORT", text="Send to render")
-
-        else:
-            box.label(text="Click Refresh to find shots.", icon="INFO")
-
 class VIEW3D_PT_brender_debug_panel(bpy.types.Panel):
     bl_label = "bRender Debug"
     bl_space_type = 'VIEW_3D'
@@ -1269,7 +1388,7 @@ class VIEW3D_PT_brender_debug_panel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-
+        
         box = layout.box()
         box.label(text="Single Shot Debugger", icon="CONSOLE")
         col = box.column()
@@ -1294,11 +1413,12 @@ class VIEW3D_PT_brender_debug_panel(bpy.types.Panel):
         row.operator("wm.save_as_mainfile", text="Save Copy...", icon="FILE_TICK")
         row.operator("wm.save_mainfile", text="Save This File", icon="FILE_TICK")
 
-
 # --- REGISTRATION ---
 classes = (
     BRENDER_ShotListItem,
-    BRENDER_UL_shot_list, 
+    BRENDER_UL_shot_list,
+    BRENDER_AddonPreferences, 
+    BRENDER_OT_select_all_shots, 
     BRENDER_OT_prepare_active_shot,
     BRENDER_OT_prepare_this_file,
     BRENDER_OT_refresh_shot_list,
@@ -1323,45 +1443,48 @@ def register():
     bpy.types.Scene.brender_shot_list = bpy.props.CollectionProperty(type=BRENDER_ShotListItem)
     bpy.types.Scene.brender_active_shot_index = bpy.props.IntProperty()
 
-    bpy.types.Scene.brender_project_code = bpy.props.StringProperty(
-        name="Project Code", default="3212")
-    bpy.types.Scene.brender_task = bpy.props.StringProperty(
-        name="Task", default="layout_r")
-    bpy.types.Scene.brender_output_base = bpy.props.StringProperty(
-        name="Render Output Base", default="S:\\3212-EDIT\\SOURCE\\LAYOUT_RENDER\\", subtype='DIR_PATH')
-
-    # --- DEADLINE PROPERTIES ---
-    bpy.types.Scene.brender_use_deadline = bpy.props.BoolProperty(
-        name="Use Deadline", default=False, description="Automatically submit to Deadline after generating file")
+    # --- FARM CONFIG (SCENE LEVEL) ---
+    bpy.types.Scene.brender_show_farm_settings = bpy.props.BoolProperty(
+        name="Show Farm Settings", default=False)
     
-    # Default Deadline Command Path (Windows default)
-    default_deadline_path = r"C:\Program Files\Thinkbox\Deadline10\bin\deadlinecommand.exe"
-    if sys.platform == "darwin": # macOS
-        default_deadline_path = "/Applications/Thinkbox/Deadline10/Resources/deadlinecommand"
-    elif sys.platform == "linux":
-        default_deadline_path = "/opt/Thinkbox/Deadline10/bin/deadlinecommand"
+    bpy.types.Scene.brender_deadline_pool = bpy.props.StringProperty(
+        name="Pool", default="renderstations", description="Main Deadline Pool")
+    
+    bpy.types.Scene.brender_deadline_secondary_pool = bpy.props.StringProperty(
+        name="Secondary Pool", default="workstations", description="Secondary Deadline Pool")
 
-    bpy.types.Scene.brender_deadline_path = bpy.props.StringProperty(
-        name="Deadline Command", 
-        default=default_deadline_path, 
-        subtype='FILE_PATH',
-        description="Path to deadlinecommand executable"
-    )
+    bpy.types.Scene.brender_deadline_group = bpy.props.StringProperty(
+        name="Group", default="krutart_renderfarm", description="Deadline Group")
+    
+    bpy.types.Scene.brender_deadline_priority = bpy.props.IntProperty(
+        name="Priority", default=52, min=0, max=100, description="Job Priority")
 
     bpy.types.Scene.brender_debug_shot_name = bpy.props.StringProperty()
     bpy.types.Scene.brender_debug_status_message = bpy.props.StringProperty()
+    
+    # --- REGISTER HANDLERS ---
+    bpy.app.handlers.load_post.append(auto_refresh_shot_list)
+    bpy.app.handlers.depsgraph_update_post.append(auto_refresh_shot_list)
+    
     log.info("bRender addon registered successfully.")
 
 def unregister():
-    del bpy.types.Scene.brender_deadline_path
-    del bpy.types.Scene.brender_use_deadline
+    # --- UNREGISTER HANDLERS ---
+    if auto_refresh_shot_list in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(auto_refresh_shot_list)
+    if auto_refresh_shot_list in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(auto_refresh_shot_list)
+
+    del bpy.types.Scene.brender_show_farm_settings
+    del bpy.types.Scene.brender_deadline_pool
+    del bpy.types.Scene.brender_deadline_secondary_pool
+    del bpy.types.Scene.brender_deadline_group
+    del bpy.types.Scene.brender_deadline_priority
+
     del bpy.types.Scene.brender_debug_shot_name
     del bpy.types.Scene.brender_debug_status_message
-    del bpy.types.Scene.brender_output_base
     del bpy.types.Scene.brender_active_shot_index
     del bpy.types.Scene.brender_shot_list
-    del bpy.types.Scene.brender_project_code
-    del bpy.types.Scene.brender_task
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

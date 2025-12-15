@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Krutart Layout Suite",
     "author": "IORI, Krutart, Gemini",
-    "version": (3, 5, 0),  # Bumped for Channel/Length Fixes
+    "version": (3, 7, 2),  # Bumped for Auto-Resolution Fix (No zero-click change)
     "blender": (4, 5, 0),
     "location": "3D View > UI > Layout Suite",
     "description": "A unified addon for scene setup, animatic import, and a persistent camera switcher based on timeline markers.",
@@ -155,15 +155,25 @@ def create_marker_from_strip(scene, strip):
 
 # --- CAMERA SWITCHER LOGIC ---
 
-def update_all_shot_cameras(self, context):
-    if not context.scene:
+def apply_shot_camera_state(scene, update_resolution=True):
+    """
+    Core logic to apply camera settings.
+    Separated to allow controlling resolution updates independently.
+    """
+    if not scene:
         return
 
-    camera_suffix = context.scene.shot_camera_toggle
-    log.info(f"--- Shot Camera Switcher: Setting all scenes and markers to '{camera_suffix}' ---")
+    camera_suffix = scene.shot_camera_toggle
+    
+    log_msg = f"--- Shot Camera Switcher: Setting all scenes and markers to '{camera_suffix}'"
+    if not update_resolution:
+        log_msg += " (Resolution Update SKIPPED) ---"
+    else:
+        log_msg += " ---"
+    log.info(log_msg)
 
-    for scene in bpy.data.scenes:
-        # Resolution switching
+    # Resolution switching (Only if triggered by user/UI)
+    if update_resolution:
         if camera_suffix == 'FLAT':
             if (scene.render.resolution_x != 1920) or (scene.render.resolution_y != 1080):
                 scene.render.resolution_x = 1920
@@ -173,21 +183,28 @@ def update_all_shot_cameras(self, context):
                 scene.render.resolution_x = 2048
                 scene.render.resolution_y = 2048
 
-        # Marker binding
-        for marker in scene.timeline_markers:
-            if marker.name.startswith("CAM-SC"):
-                shot_name = marker.name
-                target_cam_name = f"{shot_name}-{camera_suffix}"
-                target_cam_obj = bpy.data.objects.get(target_cam_name)
-                
-                if target_cam_obj and target_cam_obj.type == 'CAMERA':
-                    marker.camera = target_cam_obj
-                else:
-                    marker.camera = None
+    # Marker binding
+    for marker in scene.timeline_markers:
+        if marker.name.startswith("CAM-SC"):
+            shot_name = marker.name
+            target_cam_name = f"{shot_name}-{camera_suffix}"
+            target_cam_obj = bpy.data.objects.get(target_cam_name)
+            
+            if target_cam_obj and target_cam_obj.type == 'CAMERA':
+                marker.camera = target_cam_obj
+            else:
+                marker.camera = None
 
     if bpy.context.scene:
         on_frame_change(bpy.context.scene)
-    
+
+
+def update_all_shot_cameras(self, context):
+    """
+    Callback for the UI Property.
+    Since this is a user action, we ALLOW resolution updates.
+    """
+    apply_shot_camera_state(context.scene, update_resolution=True)
     return None
 
 
@@ -219,8 +236,12 @@ def draw_camera_toggle(self, context):
 
 @persistent
 def on_file_loaded(dummy):
+    """
+    Handler for file load.
+    We apply marker logic but PREVENT resolution changes to respect the saved file state.
+    """
     if bpy.context.scene:
-        update_all_shot_cameras(bpy.context.scene, bpy.context)
+        apply_shot_camera_state(bpy.context.scene, update_resolution=False)
 
 
 # --- Collection Setup Operators ---
@@ -279,7 +300,7 @@ class SCENE_OT_create_enviro_structure(bpy.types.Operator):
 class SCENE_OT_create_scene_structure(bpy.types.Operator):
     bl_idname = "scene.create_scene_structure"
     bl_label = "Setup SCENE Collections"
-    bl_description = "Creates SCENE collections"
+    bl_description = "Creates SCENE collections based on the active scene name"
 
     def execute(self, context):
         scene = context.scene
@@ -372,7 +393,7 @@ class SCENE_OT_verify_shot_collections(bpy.types.Operator):
 class SEQUENCER_OT_import_single_guide(bpy.types.Operator):
     bl_idname = "sequencer.import_single_guide"
     bl_label = "Import Single Guide"
-    bl_description = "Imports a single guide clip (Video Ch2, Audio Ch1) and creates a marker"
+    bl_description = "Imports a single guide clip (Video Ch2, Audio Ch1), creates markers, and sets end frame."
     bl_options = {"REGISTER", "UNDO"}
 
     filepath: StringProperty(name="File Path", subtype="FILE_PATH")
@@ -410,17 +431,40 @@ class SEQUENCER_OT_import_single_guide(bpy.types.Operator):
                 # Robustly find the new strips using selection
                 new_strips = context.selected_sequences
                 video_strip = None
+                audio_strip = None
                 
                 for s in new_strips:
                     if s.type == 'MOVIE':
-                        s.channel = 2 # Force Channel 2
                         video_strip = s
                     elif s.type == 'SOUND':
-                        s.channel = 1 # Force Channel 1
-
+                        audio_strip = s
+                
+                # Safe Channel Sorting: Video -> 8 (Temp), Audio -> 1, Video -> 2
                 if video_strip:
+                    video_strip.channel = 8  # Move out of the way to avoid collision with Ch2 or Ch1
+
+                if audio_strip:
+                    audio_strip.channel = 1
+                
+                if video_strip:
+                    video_strip.channel = 2
                     create_marker_from_strip(scene, video_strip)
-                    self.report({"INFO"}, f"Imported '{video_strip.name}' and set marker.")
+                    
+                    # --- END MARKER & RANGE UPDATE ---
+                    new_end_frame = video_strip.frame_start + video_strip.frame_final_duration
+                    
+                    # Update or Create END marker
+                    end_marker = scene.timeline_markers.get("END")
+                    if end_marker:
+                        end_marker.frame = new_end_frame
+                    else:
+                        scene.timeline_markers.new(name="END", frame=new_end_frame)
+                        
+                    # Update Scene Frame Range
+                    # Subtract 1 because frame_final_duration is exclusive (start of next shot)
+                    scene.frame_end = int(new_end_frame - 1)
+                    
+                    self.report({"INFO"}, f"Imported '{video_strip.name}', set markers, and updated frame range.")
                 else:
                     self.report({"WARNING"}, "Imported strip, but could not locate it via selection.")
 
@@ -577,15 +621,24 @@ class SEQUENCER_OT_import_animatic_guides(bpy.types.Operator):
                     # Robustly find the new strips using selection
                     new_strips = context.selected_sequences
                     video_strip = None
+                    audio_strip = None
                     
                     for s in new_strips:
                         if s.type == 'MOVIE':
-                            s.channel = 2 # Force Channel 2
                             video_strip = s
                         elif s.type == 'SOUND':
-                            s.channel = 1 # Force Channel 1
+                            audio_strip = s
                     
+                    # Safe Channel Sorting: Video -> 8 (Temp), Audio -> 1, Video -> 2
                     if video_strip:
+                        video_strip.channel = 8  # Move out of the way
+                        
+                    if audio_strip:
+                        audio_strip.channel = 1
+                        
+                    if video_strip:
+                        video_strip.channel = 2
+                        
                         # Create Marker
                         marker_name = f"CAM-{shot_data['sc']}-{shot_data['sh']}"
                         scene.timeline_markers.new(name=marker_name, frame=current_frame)
@@ -596,7 +649,7 @@ class SEQUENCER_OT_import_animatic_guides(bpy.types.Operator):
                         log.warning(f"Imported {filename} but could not locate strip via selection.")
 
                 except Exception as e:
-                     log.error(f"Error importing {filename}: {e}")
+                      log.error(f"Error importing {filename}: {e}")
 
         # 5. Finalize
         scene.frame_start = 1
@@ -609,16 +662,18 @@ class SEQUENCER_OT_import_animatic_guides(bpy.types.Operator):
         else:
             scene.timeline_markers.new(name="END", frame=current_frame)
             
-        # Run Scene Setup (Create collections if missing)
-        bpy.ops.scene.create_scene_structure()
+        # REMOVED AUTOMATIC SCENE STRUCTURE CREATION
+        # bpy.ops.scene.create_scene_structure()
         
         # Run Camera Setup (Create rigs if missing)
+        # Note: This will now fail gracefully if collections don't exist
         bpy.ops.scene.setup_cameras_from_markers()
         
         # Force Camera Switcher Update (Rebinds all markers to cameras)
+        # Using the UI callback wrapper to ensure update logic matches user intent
         update_all_shot_cameras(scene, context)
 
-        self.report({"INFO"}, f"Successfully imported and setup {len(sorted_shot_nums)} shots.")
+        self.report({"INFO"}, f"Imported {len(sorted_shot_nums)} shots. Run 'Initial Scene Setup' if collections are missing.")
         return {"FINISHED"}
 
     def invoke(self, context, event):
@@ -659,7 +714,7 @@ class SCENE_OT_setup_cameras_from_markers(bpy.types.Operator):
         shot_vfx_collection = bpy.data.collections.get(f"SHOT-VFX-{base_name}")
 
         if not all([shot_ani_collection, shot_art_collection, shot_vfx_collection]):
-             self.report({"ERROR"}, "Parent collections missing. Run 'Setup SCENE Collections'.")
+             self.report({"WARNING"}, "Scene collections (SHOT-ANI, etc) not found. Skipping Camera Setup. Run 'Initial Scene Setup' or create them manually.")
              return {"CANCELLED"}
 
         camera_offset_counter = 0
@@ -719,7 +774,8 @@ class SCENE_OT_setup_cameras_from_markers(bpy.types.Operator):
                 log.error(f"Error appending camera for {marker.name}: {e}")
 
         hide_collections_in_view_layer("cam_boneshapes", hide=True)
-        update_all_shot_cameras(scene, context)
+        # Ensure we bind cameras, but DO NOT force resolution change just by running setup
+        apply_shot_camera_state(scene, update_resolution=False)
         
         return {"FINISHED"}
 
