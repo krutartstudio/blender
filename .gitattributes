@@ -1,0 +1,5 @@
+# Live working values (Apps Script / Sheet IDs, NAS address, accounts) never enter git:
+# the clean filter swaps them for KRUTART_REDACTED_* placeholders on commit and the smudge
+# filter puts them back on checkout. Filter + secret map live in .git/ (see DEVELOPMENT/AGENTS.md).
+*.py  filter=krutart-secrets
+*.txt filter=krutart-secrets

@@ -8,7 +8,7 @@ from bpy.app.handlers import persistent
 bl_info = {
     "name": "Krutart OS Bridge",
     "author": "Krutart, iori, gemini",
-    "version": (1, 7, 9),
+    "version": (1, 7, 10),
     "blender": (4, 5, 0),
     "location": "Edit > Preferences > Addons > Krutart OS Bridge",
     "description": "Cross-OS path bridge. Forces canonical Windows paths and auto-fixes Ghost Files.",
@@ -227,27 +227,47 @@ def to_mac_absolute(dirty_path, context, force=False):
 
 
 # ------------------------------------------------------------------------
-#   ITERATOR
+#   DATA COLLECTOR (Thread-Safe Lookup to Prevent Blender C-Pointer Crashes)
 # ------------------------------------------------------------------------
 
 
-def iter_external_data():
-    for lib in bpy.data.libraries:
-        yield lib, "filepath"
-    for img in bpy.data.images:
-        if img.source in {"FILE", "SEQUENCE", "MOVIE"}:
-            yield img, "filepath"
-    for cache in bpy.data.cache_files:
-        yield cache, "filepath"
-    for snd in bpy.data.sounds:
-        yield snd, "filepath"
-    for font in bpy.data.fonts:
-        yield font, "filepath"
-    for clip in bpy.data.movieclips:
-        yield clip, "filepath"
-    for vol in bpy.data.volumes:
-        yield vol, "filepath"
-
+def collect_external_data():
+    """
+    Collects metadata for all external assets in the file.
+    Returns a list of dicts. Does not return active Blender RNA objects
+    to avoid dangling pointer crashes during updates/reloads.
+    """
+    results = []
+    
+    # 1. Standard collections in bpy.data
+    collections = {
+        "libraries": "filepath",
+        "images": "filepath",
+        "cache_files": "filepath",
+        "sounds": "filepath",
+        "fonts": "filepath",
+        "movieclips": "filepath",
+        "volumes": "filepath"
+    }
+    
+    for coll_name, prop in collections.items():
+        coll = getattr(bpy.data, coll_name, None)
+        if not coll:
+            continue
+        for item in coll:
+            # Filter for file-based images only
+            if coll_name == "images":
+                if getattr(item, "source", None) not in {"FILE", "SEQUENCE", "MOVIE"}:
+                    continue
+            results.append({
+                "type": "LIBRARY" if coll_name == "libraries" else "DATABLOCK",
+                "collection": coll_name,
+                "name": item.name,
+                "prop": prop,
+                "current_path": getattr(item, prop, "")
+            })
+            
+    # 2. Sequencer Strips (Scene-dependent)
     for scene in bpy.data.scenes:
         if not scene.sequence_editor:
             continue
@@ -258,9 +278,23 @@ def iter_external_data():
         )
         for strip in strips:
             if hasattr(strip, "filepath"):
-                yield strip, "filepath"
+                results.append({
+                    "type": "STRIP",
+                    "scene_name": scene.name,
+                    "name": strip.name,
+                    "prop": "filepath",
+                    "current_path": strip.filepath
+                })
             if hasattr(strip, "directory"):
-                yield strip, "directory"
+                results.append({
+                    "type": "STRIP",
+                    "scene_name": scene.name,
+                    "name": strip.name,
+                    "prop": "directory",
+                    "current_path": strip.directory
+                })
+                
+    return results
 
 
 # ------------------------------------------------------------------------
@@ -271,62 +305,113 @@ def iter_external_data():
 def run_bridge_to_mac(context, force=False):
     if sys.platform.startswith("win"):
         return 0
-    count = 0
-    for item, prop in iter_external_data():
-        current_path = getattr(item, prop)
-        # We pass 'force' here to bypass exists() check
+    
+    items_info = collect_external_data()
+    updates = []
+    
+    for info in items_info:
+        current_path = info["current_path"]
         new_path = to_mac_absolute(current_path, context, force=force)
-
         if new_path and new_path != current_path:
-            item[WIN_PATH_KEY] = current_path
+            updates.append((info, new_path))
             
-            if isinstance(item, bpy.types.Library):
+    count = 0
+    for info, new_path in updates:
+        if info["type"] in {"LIBRARY", "DATABLOCK"}:
+            coll = getattr(bpy.data, info["collection"], None)
+            if not coll:
+                continue
+            item = coll.get(info["name"])
+            if not item:
+                continue
+                
+            item[WIN_PATH_KEY] = info["current_path"]
+            
+            if info["type"] == "LIBRARY":
                 try:
-                    # 1. Update filepath string directly (crucial for red stubs)
                     item.filepath = new_path
-                    
-                    # 2. Try the UI operator (handles internal cleanups/syncs)
                     try:
                         bpy.ops.wm.lib_reload(library=item.name)
                     except:
                         pass
-                    
-                    # 3. Force internal reload if still missing or operator failed
                     if item.is_missing:
                         item.reload()
-                        
                 except Exception as e:
                     print(f"[Krutart Bridge] Failed to reload library {item.name}: {e}")
             else:
-                setattr(item, prop, new_path)
+                setattr(item, info["prop"], new_path)
                 if hasattr(item, "reload"):
                     try:
                         item.reload()
                     except:
                         pass
-                        
             count += 1
+            
+        elif info["type"] == "STRIP":
+            scene = bpy.data.scenes.get(info["scene_name"])
+            if not scene or not scene.sequence_editor:
+                continue
+            strips = getattr(
+                scene.sequence_editor,
+                "sequences_all",
+                getattr(scene.sequence_editor, "sequences", []),
+            )
+            strip = strips.get(info["name"])
+            if not strip:
+                continue
+            setattr(strip, info["prop"], new_path)
+            count += 1
+            
     return count
 
 
 def run_bridge_to_windows(context):
     is_win = sys.platform.startswith("win")
-    count = 0
+    items_info = collect_external_data()
+    updates = []
     
-    for item, prop in iter_external_data():
-        current_path = getattr(item, prop)
+    for info in items_info:
+        current_path = info["current_path"]
         
         if is_win:
-            # On Windows, we simply sanitize dirty paths to the canonical drive
             win_path = sanitize_windows_absolute(current_path, context)
         else:
-            # On Mac, we map the Mac path to the Windows equivalent before saving
             win_path = to_win_absolute(current_path, context)
-            if not win_path and item.get(WIN_PATH_KEY):
-                win_path = item[WIN_PATH_KEY]
-
+            if not win_path:
+                if info["type"] in {"LIBRARY", "DATABLOCK"}:
+                    coll = getattr(bpy.data, info["collection"], None)
+                    if coll:
+                        item = coll.get(info["name"])
+                        if item and item.get(WIN_PATH_KEY):
+                            win_path = item[WIN_PATH_KEY]
+                            
         if win_path and win_path != current_path:
-            setattr(item, prop, win_path)
+            updates.append((info, win_path))
+            
+    count = 0
+    for info, new_path in updates:
+        if info["type"] in {"LIBRARY", "DATABLOCK"}:
+            coll = getattr(bpy.data, info["collection"], None)
+            if not coll:
+                continue
+            item = coll.get(info["name"])
+            if not item:
+                continue
+            setattr(item, info["prop"], new_path)
+            count += 1
+        elif info["type"] == "STRIP":
+            scene = bpy.data.scenes.get(info["scene_name"])
+            if not scene or not scene.sequence_editor:
+                continue
+            strips = getattr(
+                scene.sequence_editor,
+                "sequences_all",
+                getattr(scene.sequence_editor, "sequences", []),
+            )
+            strip = strips.get(info["name"])
+            if not strip:
+                continue
+            setattr(strip, info["prop"], new_path)
             count += 1
             
     return count
@@ -335,9 +420,12 @@ def run_bridge_to_windows(context):
 def run_windows_adaptive_fallback(context):
     if not sys.platform.startswith("win"):
         return 0
-    count = 0
-    for item, prop in iter_external_data():
-        current_path = getattr(item, prop)
+        
+    items_info = collect_external_data()
+    updates = []
+    
+    for info in items_info:
+        current_path = info["current_path"]
         if not current_path:
             continue
             
@@ -346,13 +434,24 @@ def run_windows_adaptive_fallback(context):
         except:
             abs_path = current_path
             
-        # Only fallback if the current path is actively broken
         if Path(abs_path).exists():
             continue
             
         new_path = to_win_adaptive(current_path, context)
         if new_path and new_path != current_path and Path(new_path).exists():
-            if isinstance(item, bpy.types.Library):
+            updates.append((info, new_path))
+            
+    count = 0
+    for info, new_path in updates:
+        if info["type"] in {"LIBRARY", "DATABLOCK"}:
+            coll = getattr(bpy.data, info["collection"], None)
+            if not coll:
+                continue
+            item = coll.get(info["name"])
+            if not item:
+                continue
+                
+            if info["type"] == "LIBRARY":
                 try:
                     item.filepath = new_path
                     try:
@@ -364,13 +463,28 @@ def run_windows_adaptive_fallback(context):
                 except Exception as e:
                     print(f"[Krutart Bridge] Failed to reload library {item.name}: {e}")
             else:
-                setattr(item, prop, new_path)
+                setattr(item, info["prop"], new_path)
                 if hasattr(item, "reload"):
                     try:
                         item.reload()
                     except:
                         pass
             count += 1
+        elif info["type"] == "STRIP":
+            scene = bpy.data.scenes.get(info["scene_name"])
+            if not scene or not scene.sequence_editor:
+                continue
+            strips = getattr(
+                scene.sequence_editor,
+                "sequences_all",
+                getattr(scene.sequence_editor, "sequences", []),
+            )
+            strip = strips.get(info["name"])
+            if not strip:
+                continue
+            setattr(strip, info["prop"], new_path)
+            count += 1
+            
     return count
 
 
@@ -492,19 +606,23 @@ class KRUTART_OT_Diagnose(bpy.types.Operator):
             root = get_mac_root(context)
             print(f"Detected Mac Root: {root}")
 
-        for item, prop in iter_external_data():
-            raw = getattr(item, prop)
+        items_info = collect_external_data()
+        for info in items_info:
+            raw = info["current_path"]
             
             if is_win:
                 calc = sanitize_windows_absolute(raw, context)
             else:
                 calc = to_mac_absolute(raw, context, force=True)
                 
-            print(f"Item: {item.name}")
+            print(f"Item: {info['name']} (Type: {info['type']}, Prop: {info['prop']})")
             print(f"  Raw: {raw}")
             print(f"  Calc: {calc}")
             if calc:
-                exists = Path(calc).exists()
+                try:
+                    exists = Path(calc).exists()
+                except:
+                    exists = False
                 print(f"  Exists on Disk: {exists}")
 
         self.report(

@@ -38,7 +38,7 @@ class LayoutCameraAddonPreferences(AddonPreferences):
         name="Linux Camera Hero File",
         description="Path to the master camera rig .blend file for Linux",
         subtype="FILE_PATH",
-        default="/run/user/1000/gvfs/afp-volume:host=172.16.20.2,user=fred,volume=VELKE_PROJEKTY/3212-PREPRODUCTION/LIBRARY/LIBRARY-HERO/RIG-HERO/CAMERA-HERO/3212-camera-hero.blend",
+        default="/run/user/1000/gvfs/afp-volume:host=KRUTART_REDACTED_PRIVATE_IP_1,user=KRUTART_REDACTED_NAS_USER_1,volume=VELKE_PROJEKTY/3212-PREPRODUCTION/LIBRARY/LIBRARY-HERO/RIG-HERO/CAMERA-HERO/3212-camera-hero.blend",
     )
 
     def draw(self, context):

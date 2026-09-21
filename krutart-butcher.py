@@ -1,6 +1,6 @@
 bl_info = {
     "name": "Krutart Butcher Suite",
-    "version": (2, 5, 1),
+    "version": (2, 5, 5),
     "blender": (4, 5, 0),
     "location": "3D View > UI > Butcher",
     "description": "Butching [LOC/ANI/ART] pipeline tool for cleaning, publishing, and relinking.",
@@ -220,12 +220,14 @@ def _safe_remove_scene(context, scene):
 def _safe_remove_collection(context, collection):
     """
     Removes a collection with window context override to prevent crashes.
-    For library overrides, we strictly unlink them from the scene/hierarchy 
-    rather than deleting them directly, allowing the orphan_purge pass to handle
-    disposal safely without triggering the bke.liboverride_resync Segfault!
+    For linked or overridden libraries, we strictly unlink them from the local scene/hierarchy 
+    and exit early to prevent a bke.liboverride_resync Segfault!
     """
     try:
-        if getattr(collection, 'override_library', None):
+        # Check for BOTH overrides and natively linked data
+        is_linked_data = getattr(collection, 'override_library', None) is not None or collection.library is not None
+        
+        if is_linked_data:
             if context.scene.butcher_debug_mode:
                 pass
             # Unlink from scenes
@@ -236,17 +238,21 @@ def _safe_remove_collection(context, collection):
                         s.collection.children.unlink(collection)
                     except Exception as e: 
                         _debug_trace(f"    [REMOVE_COL EXCEPTION] {collection.name} from scene {s.name}: {e}")
+            
             # Unlink from other collections
             for p_col in list(bpy.data.collections):
                 if collection.name in p_col.children.keys():
-                    if getattr(p_col, 'override_library', None):
-                        continue # Cannot unlink from a parent that is also an override
+                    # If the parent is ALSO linked, we cannot unlink its children
+                    parent_is_linked = getattr(p_col, 'override_library', None) is not None or p_col.library is not None
+                    if parent_is_linked:
+                        continue 
                     try: 
                         _debug_trace(f"    [REMOVE_COL] Unlinking {collection.name} from parent {p_col.name}")
                         p_col.children.unlink(collection)
                     except Exception as e: 
                         _debug_trace(f"    [REMOVE_COL EXCEPTION] {collection.name} from parent {p_col.name}: {e}")
-            return
+            
+            return # CRITICAL: Exit early so we don't attempt to .remove() linked data
 
         win = _get_safe_win(context)
         if win:
@@ -254,27 +260,34 @@ def _safe_remove_collection(context, collection):
                 bpy.data.collections.remove(collection)
         else:
             bpy.data.collections.remove(collection)
+            
     except Exception as e:
         log.warning(f"Error in safe remove collection {collection.name}: {e}")
 
 def _safe_remove_object(context, obj):
     """
     Removes an object with window context override to prevent crashes.
-    Similarly unlinks override objects to prevent Segfaults.
+    Similarly unlinks natively linked/override objects to prevent Segfaults.
     """
     try:
-        if getattr(obj, 'override_library', None):
+        # Check for BOTH overrides and natively linked data
+        is_linked_data = getattr(obj, 'override_library', None) is not None or obj.library is not None
+        
+        if is_linked_data:
             if context.scene.butcher_debug_mode:
                 pass
             for col in list(obj.users_collection):
-                if getattr(col, 'override_library', None):
-                    continue # Cannot unlink from a parent that is also an override
+                # If the parent collection is ALSO linked, we cannot unlink its children
+                parent_is_linked = getattr(col, 'override_library', None) is not None or col.library is not None
+                if parent_is_linked:
+                    continue 
                 try: 
                     _debug_trace(f"    [REMOVE_OBJ] Unlinking {obj.name} from {col.name}")
                     col.objects.unlink(obj)
                 except Exception as e: 
                     _debug_trace(f"    [REMOVE_OBJ EXCEPTION] {obj.name} from {col.name}: {e}")
-            return
+            
+            return # CRITICAL: Exit early so we don't attempt to .remove() linked data
 
         win = _get_safe_win(context)
         if win:
@@ -282,6 +295,7 @@ def _safe_remove_object(context, obj):
                 bpy.data.objects.remove(obj, do_unlink=True)
         else:
             bpy.data.objects.remove(obj, do_unlink=True)
+            
     except Exception as e:
         log.warning(f"Error in safe remove object {obj.name}: {e}")
 
@@ -1623,7 +1637,12 @@ def _ani_reorganize(context):
     if ani_col:
         _merge_collection_to_target(ani_col, "+ANI+")
 
-    # Rename surviving VFX collection to +VFX+
+    # e.g. +VFX-SC11-APOLLO_SITE+ -> +VFX+
+    vfx_col = bpy.data.collections.get(f"+VFX-{base_name}+")
+    if vfx_col:
+        _merge_collection_to_target(vfx_col, "+VFX+")
+
+    # Merge any other surviving VFX collections to +VFX+ as a fallback
     for col in list(bpy.data.collections):
         try: cname = col.name
         except ReferenceError: continue
@@ -1631,10 +1650,14 @@ def _ani_reorganize(context):
         
         if cname_upper.startswith("+VFX-SC"):
             _merge_collection_to_target(col, "+VFX+")
-            _debug_trace(f"    [_ani_reorganize] Ensuring visibility for +VFX+")
-            tgt = bpy.data.collections.get("+VFX+")
-            if tgt:
-                _make_visible_recursive(tgt)
+
+    # Ensure the final +VFX+ collection is linked to the active scene collection and visible
+    tgt = bpy.data.collections.get("+VFX+")
+    if tgt:
+        if tgt.name not in scene.collection.children.keys():
+            scene.collection.children.link(tgt)
+        _make_visible_recursive(tgt)
+        _debug_trace(f"    [_ani_reorganize] Linked +VFX+ to scene collection and ensured visibility")
 
     # Strip -SC... suffix from key collections
     # Be careful not to mutate list mid-iteration and run into reference issues or loop forever
@@ -2671,8 +2694,15 @@ def _process_next_relink_step():
         # Save new -relink version
         _save_relink_version(current_context, sc, sh, mode)
 
-        # Reload existing libraries
-        for lib in bpy.data.libraries: lib.reload()
+        # Reload existing libraries safely using name lookup
+        lib_names = [lib.name for lib in bpy.data.libraries]
+        for name in lib_names:
+            lib = bpy.data.libraries.get(name)
+            if lib:
+                try:
+                    lib.reload()
+                except Exception as e:
+                    log.error(f"Failed to reload library {name}: {e}")
 
         # Perform actual relink
         if mode == 'ART': _relink_art(current_context, sc, sh)
@@ -2705,7 +2735,14 @@ class BUTCHER_OT_relink(Operator):
         if not selected_shots:
             mode = get_current_mode(context)
             try:
-                for lib in bpy.data.libraries: lib.reload()
+                lib_names = [lib.name for lib in bpy.data.libraries]
+                for name in lib_names:
+                    lib = bpy.data.libraries.get(name)
+                    if lib:
+                        try:
+                            lib.reload()
+                        except Exception as e:
+                            log.error(f"Failed to reload library {name}: {e}")
                 if mode == 'ART': 
                     _relink_art(context)
                 elif mode == 'ANI': 
@@ -2838,7 +2875,15 @@ def _process_next_combo_relink_step():
 
         _save_relink_version(current_context, sc, sh, mode)
 
-        for lib in bpy.data.libraries: lib.reload()
+        # Safely reload libraries using name lookup
+        lib_names = [lib.name for lib in bpy.data.libraries]
+        for name in lib_names:
+            lib = bpy.data.libraries.get(name)
+            if lib:
+                try:
+                    lib.reload()
+                except Exception as e:
+                    log.error(f"Failed to reload library {name}: {e}")
 
         if mode == 'ART': _relink_art(current_context, sc, sh)
         elif mode == 'ANI': _relink_ani(current_context, sc, sh)

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Krutart Proxy/Master Switcher",
     "author": "iori, Krutart, Gemini",
-    "version": (1, 6, 1), 
+    "version": (1, 6, 3), 
     "blender": (4, 0, 0), 
     "location": "View3D > Sidebar (N-Panel, Toggleable) & Outliner Context Menu",
     "description": "Seamlessly swap between -p (proxy) and -m (master) asset versions preserving hierarchy. Supports Batch Swapping.",
@@ -97,9 +97,8 @@ def get_base_data_block(obj):
 def get_asset_details_from_name(name, data_block, swap_property, wrapper_obj):
     """
     Helper function to parse a name and build the details dictionary.
-    This avoids code duplication in get_asset_details.
+    Optimized with Krutart OS Bridge anchor-enforced canonical pathing.
     """
-    
     # --- Isolate the duplication suffix (e.g., '.005') ---
     suffix_match = re.search(r'(\.\d{3,})$', wrapper_obj.name)
     name_suffix = suffix_match.group(1) if suffix_match else ""
@@ -116,20 +115,14 @@ def get_asset_details_from_name(name, data_block, swap_property, wrapper_obj):
     p_flag_found = False
     p_index = -1
     
-    # Find the last '-p' or '-P'
-    # We check for '-P' and '-p' separately
     p_indices = [clean_name.rfind('-p'), clean_name.rfind('-P')]
-    p_dash_index = max(p_indices) # This is the index of the dash '-'
+    p_dash_index = max(p_indices)
 
     if p_dash_index != -1:
-        # Check what follows the flag. It must be either end-of-string or a separator.
-        p_char_index = p_dash_index + 1 # This is the index of 'p' or 'P'
-        
-        # Check if it's at the end
+        p_char_index = p_dash_index + 1
         if p_char_index == len(clean_name) - 1:
             p_flag_found = True
             p_index = p_char_index
-        # Check if it's followed by a separator
         elif p_char_index + 1 < len(clean_name) and clean_name[p_char_index + 1] in {'-', '_', '.'}:
             p_flag_found = True
             p_index = p_char_index
@@ -137,24 +130,18 @@ def get_asset_details_from_name(name, data_block, swap_property, wrapper_obj):
     m_flag_found = False
     m_index = -1
     
-    # Find the last '-m' or '-M'
     m_indices = [clean_name.rfind('-m'), clean_name.rfind('-M')]
     m_dash_index = max(m_indices)
 
     if m_dash_index != -1:
-        # Check what follows the flag
-        m_char_index = m_dash_index + 1 # This is the index of 'm' or 'M'
-        
-        # Check if it's at the end
+        m_char_index = m_dash_index + 1
         if m_char_index == len(clean_name) - 1:
             m_flag_found = True
             m_index = m_char_index
-        # Check if it's followed by a separator
         elif m_char_index + 1 < len(clean_name) and clean_name[m_char_index + 1] in {'-', '_', '.'}:
             m_flag_found = True
             m_index = m_char_index
 
-    # Prioritize 'p' if both are somehow found (e.g. "asset-m-proxy-p")
     if p_flag_found and m_flag_found:
         if p_index > m_index:
             m_flag_found = False
@@ -164,31 +151,21 @@ def get_asset_details_from_name(name, data_block, swap_property, wrapper_obj):
     if p_flag_found:
         current_version_flag = "-p"
         tandem_version_flag = "-m"
-        
-        original_flag_char = clean_name[p_index] # This will be 'p' or 'P'
-        tandem_flag_char = 'm'
-        if original_flag_char.isupper():
-            tandem_flag_char = 'M'
-        
+        original_flag_char = clean_name[p_index]
+        tandem_flag_char = 'M' if original_flag_char.isupper() else 'm'
         base_name = clean_name[:p_index]
-        suffix_part = clean_name[p_index + 1:] # Get text after 'p' or 'P'
-        tandem_version_name = f"{base_name}{tandem_flag_char}{suffix_part}" # Use the correctly-cased char
+        suffix_part = clean_name[p_index + 1:]
+        tandem_version_name = f"{base_name}{tandem_flag_char}{suffix_part}"
         
     elif m_flag_found:
         current_version_flag = "-m"
         tandem_version_flag = "-p"
-
-        original_flag_char = clean_name[m_index] # This will be 'm' or 'M'
-        tandem_flag_char = 'p'
-        if original_flag_char.isupper():
-            tandem_flag_char = 'P'
-
+        original_flag_char = clean_name[m_index]
+        tandem_flag_char = 'P' if original_flag_char.isupper() else 'p'
         base_name = clean_name[:m_index]
-        suffix_part = clean_name[m_index + 1:] # Get text after 'm' or 'M'
-        tandem_version_name = f"{base_name}{tandem_flag_char}{suffix_part}" # Use the correctly-cased char
-        
+        suffix_part = clean_name[m_index + 1:]
+        tandem_version_name = f"{base_name}{tandem_flag_char}{suffix_part}"
     else:
-        # This name didn't have a flag.
         return None
 
     # --- Find Source Filepath ---
@@ -197,97 +174,98 @@ def get_asset_details_from_name(name, data_block, swap_property, wrapper_obj):
     
     if swap_property == "LIBRARY_OVERRIDE":
         debug_log(f"Override asset detected. Getting source from override main.")
-        
-        # Blender 4.0 / 4.1+ API compatibility
         override_prop = None
         if hasattr(data_block, "library_override"):
-            override_prop = data_block.library_override # Blender 4.1+
+            override_prop = data_block.library_override
         elif hasattr(data_block, "override_library"):
-            override_prop = data_block.override_library # Blender 4.0
+            override_prop = data_block.override_library
         
         if data_block and override_prop:
-            # Get the *original* linked asset's library
             original_main = None
-            # .reference is used in 4.0 and 4.2+
             if hasattr(override_prop, "reference"):
                 original_main = override_prop.reference
             elif hasattr(override_prop, "main"):
-                original_main = override_prop.main # Blender 4.1
+                original_main = override_prop.main
 
             if original_main and original_main.library:
                 source_filepath = original_main.library.filepath
                 debug_log(f"Found linked override asset. Source: {source_filepath}")
             else:
                 debug_log(f"Override collection '{data_block.name}' has no 'main'/'reference' or library.")
-                is_local = True # Fallback
+                is_local = True
         else:
-             is_local = True # Fallback
+             is_local = True
     
     if not source_filepath:
-        # Original logic for non-override assets
         if data_block and data_block.library:
             source_filepath = data_block.library.filepath
             debug_log(f"Found linked asset. Source: {source_filepath}")
         else:
             is_local = True
-            source_filepath = bpy.data.filepath # Current file
+            source_filepath = bpy.data.filepath
             if is_local:
                 debug_log("Found local asset.")
             
     if not source_filepath:
-            debug_log("Could not determine source filepath. Skipping.")
-            return None
+        debug_log("Could not determine source filepath. Skipping.")
+        return None
 
-    # --- START PATH RESOLUTION (v1.3.0) ---
+    # --- START ANCHOR-BASED PATH RESOLUTION (Patched via OS Bridge Mechanics) ---
     def resolve_path(dirty_path):
         import sys
         from pathlib import Path
         
-        if not dirty_path or sys.platform.startswith("win"):
+        if not dirty_path:
             return dirty_path
             
-        # We are on Mac/Linux. Try to translate standard Windows paths
         PROJECT_NAME = "3212-PREPRODUCTION"
-        clean_str = dirty_path.replace("\\", "/")
-        idx = clean_str.find(PROJECT_NAME)
+        PRODUCTION_NAME = "3212-PRODUCTION"
+        DEFAULT_WIN_DRIVE = "S:"
         
-        if idx != -1:
-            relative_part = clean_str[idx:]
-            
-            # Find local Mac root
-            mac_root = None
-            if bpy.data.filepath:
-                curr = Path(bpy.data.filepath).resolve()
-                for p in [curr] + list(curr.parents):
-                    if p.name == PROJECT_NAME:
-                        mac_root = p
-                        break
-            
-            if not mac_root:
-                home = Path.home()
-                candidates = [
-                    home / "Library/CloudStorage/GoogleDrive-jorik.chase@krutart.cz/Shared drives" / PROJECT_NAME,
-                    home / "Library/CloudStorage/GoogleDrive-handak.daniel@gmail.com/Shared drives" / PROJECT_NAME,
-                    Path(f"/Volumes/GoogleDrive/Shared drives/{PROJECT_NAME}"),
-                ]
-                for cand in candidates:
-                    if cand.exists():
-                        mac_root = cand
-                        break
-                        
-            if mac_root:
-                target = mac_root.parent / relative_part
-                if target.exists():
-                    debug_log(f"Path Translator: Resolved '{dirty_path}' -> '{target}'")
-                    return str(target)
-                else:
-                    debug_log(f"Path Translator: Target does not exist on disk: '{target}'")
-                    
-        return dirty_path
+        # Windows: Force Canonical Letter-Mapped drive instead of raw network host shares
+        if sys.platform.startswith("win"):
+            clean_str = dirty_path.replace("/", "\\")
+            for anchor in [PROJECT_NAME, PRODUCTION_NAME]:
+                idx = clean_str.find(anchor)
+                if idx != -1:
+                    # Strips out messy IP networks or network storage hosts cleanly
+                    return f"{DEFAULT_WIN_DRIVE}\\{clean_str[idx:]}"
+            return clean_str
+        
+        # Mac/Linux Translation Logic
+        else:
+            clean_str = dirty_path.replace("\\", "/")
+            for anchor in [PROJECT_NAME, PRODUCTION_NAME]:
+                idx = clean_str.find(anchor)
+                if idx != -1:
+                    relative_part = clean_str[idx:]
+                    mac_root = None
+                    if bpy.data.filepath:
+                        curr = Path(bpy.data.filepath).resolve()
+                        for p in [curr] + list(curr.parents):
+                            if p.name == PROJECT_NAME:
+                                mac_root = p
+                                break
+                    if not mac_root:
+                        home = Path.home()
+                        candidates = [
+                            home / "Library/CloudStorage/KRUTART_REDACTED_ACCOUNT_2/Shared drives" / PROJECT_NAME,
+                            home / "Library/CloudStorage/KRUTART_REDACTED_ACCOUNT_1/Shared drives" / PROJECT_NAME,
+                            Path(f"/Volumes/GoogleDrive/Shared drives/{PROJECT_NAME}"),
+                        ]
+                        for cand in candidates:
+                            if cand.exists():
+                                mac_root = cand
+                                break
+                    if mac_root:
+                        target = mac_root.parent / relative_part
+                        return str(target)
+            return dirty_path
     # --- END PATH RESOLUTION ---
 
-    # Resolve the path using the new translator
-    final_source_filepath = resolve_path(os.path.realpath(bpy.path.abspath(source_filepath)))
+    # FIX: os.path.normpath used instead of os.path.realpath to preserve S:\ network layout format
+    clean_abs_path = os.path.normpath(bpy.path.abspath(source_filepath))
+    final_source_filepath = resolve_path(clean_abs_path)
 
     details = {
         "wrapper_object": wrapper_obj,
@@ -298,10 +276,10 @@ def get_asset_details_from_name(name, data_block, swap_property, wrapper_obj):
         "is_local": is_local,
         "current_version_flag": current_version_flag,
         "tandem_version_flag": tandem_version_flag,
-        "tandem_version_name": tandem_version_name, # CLEAN target name for finding in external library
-        "name_suffix": name_suffix,                 # Saved .xxx suffix to append post-swap
-        "clean_base_name": clean_name,              # Clean base name for validation
-        "asset_name_source": name # Store the original name we matched on
+        "tandem_version_name": tandem_version_name,
+        "name_suffix": name_suffix,
+        "clean_base_name": clean_name,
+        "asset_name_source": name
     }
 
     return details
@@ -802,6 +780,7 @@ class MY_OT_swap_asset_version(Operator):
     def perform_swap(self, context, obj, details):
         """
         Encapsulated swap logic for a single object.
+        Robustly patched for mixed datablocks, network drive tracking, and protected renames.
         """
         tandem_name = details['tandem_version_name'] # Clean base name WITHOUT .xxx
         name_suffix = details.get('name_suffix', '') # Suffix .xxx isolated earlier
@@ -856,7 +835,7 @@ class MY_OT_swap_asset_version(Operator):
             else:
                 raise Exception(f"Unsupported data block type: {data_block_type}")
 
-        # --- 2. Smart Fetcher: Prevents Overrides of Overrides by strictly finding Linked Data ---
+        # --- Smart Fetcher ---
         tandem_data_block = None
         
         if not is_local:
@@ -878,7 +857,7 @@ class MY_OT_swap_asset_version(Operator):
         if tandem_data_block:
             debug_log(f"Tandem asset found in current bpy.data: {tandem_data_block.name}")
         
-        # 3. If not found, safely link from source_filepath
+        # If not found, safely link from source_filepath
         else:
             if is_local:
                 raise Exception(f"Asset is local, but pure tandem '{tandem_name}' not found in file.")
@@ -944,70 +923,62 @@ class MY_OT_swap_asset_version(Operator):
             target_obj.scale = source_obj.scale
             
         def find_root_objects(collection):
-            # Find objects in the collection that have no parent, or their parent 
-            # is outside this collection.
             roots = []
             if not collection: return roots
             coll_obj_names = {o.name for o in collection.all_objects}
             for obj in collection.all_objects:
-                # Removed the type filter: cameras, lights, etc. are all perfectly valid roots
                 if obj.parent is None or obj.parent.name not in coll_obj_names:
                     roots.append(obj)
             return roots
             
         def purge_override_hierarchy(collection):
-            """Deep deletes an override collection and all its contents."""
+            """Safe structural cleanup ensuring linked asset memory boundaries are preserved."""
             if not collection: return
-            debug_log(f"Purging override hierarchy: {collection.name}")
+            debug_log(f"Purging local override structures for: {collection.name}")
             
-            # 1. Remove all objects
+            # 1. Clean up local/override object blocks only (skips real asset library blocks)
             obs_to_remove = list(collection.all_objects)
             for obj in obs_to_remove:
                 try:
-                    bpy.data.objects.remove(obj, do_unlink=True)
+                    if obj.library is None:
+                        bpy.data.objects.remove(obj, do_unlink=True)
                 except Exception as e:
-                    debug_log(f"Warning: Could not remove object {getattr(obj, 'name', 'Unknown')}: {e}")
+                    debug_log(f"Warning: Could not remove object structural block: {e}")
                 
-            # 2. Remove all child collections
+            # 2. Clean up local child collections
             cols_to_remove = list(collection.children)
             for child in cols_to_remove:
                 try:
-                    bpy.data.collections.remove(child, do_unlink=True)
+                    if child.library is None:
+                        bpy.data.collections.remove(child, do_unlink=True)
                 except Exception as e:
-                    debug_log(f"Warning: Could not remove child collection {getattr(child, 'name', 'Unknown')}: {e}")
+                    debug_log(f"Warning: Could not remove child collection structural block: {e}")
                 
-            # 3. Remove the parent collection itself
+            # 3. Structural unlink from scene hierarchy
             try:
-                # Force unlink from all parent collections first
                 for p_col in bpy.data.collections:
                     if collection.name in p_col.children:
                         p_col.children.unlink(collection)
                 if collection.name in context.scene.collection.children:
                     context.scene.collection.children.unlink(collection)
                     
-                # The crucial step: If it's a proxy that lost its override status, removing it via do_unlink=True
-                # might fail gracefully if it thinks it's strictly linked. We must ensure it's deleted.
-                if collection in bpy.data.collections.values():
+                if collection in bpy.data.collections.values() and collection.library is None:
                     bpy.data.collections.remove(collection, do_unlink=True)
-                    
             except Exception as e:
-                debug_log(f"Warning: Could not remove parent collection {getattr(collection, 'name', 'Unknown')}: {e}")
+                debug_log(f"Warning: Could not clear parent collection wrapper: {e}")
 
         def strip_name(name):
-            # Strip trailing .001 and standardize M/P flags for matching
             base = name.split('.')[0]
             base = base.replace('-M-', '-').replace('-P-', '-')
             base = base.replace('_M_P_', '_').replace('_M_M_', '_')
             return base
 
-        # 6. Perform the swap
+        # --- Perform the swap ---
         wrapper_obj = details['wrapper_object']
         swap_prop = details['swap_property']
         
-        # --- EDGE CASE IDENTIFICATION ---
         is_source_override = (swap_prop == "LIBRARY_OVERRIDE")
         is_source_empty = (swap_prop == "instance_collection")
-        
         target_version = details.get('tandem_version_flag', '').lower()
         
         is_target_override = False
@@ -1017,16 +988,14 @@ class MY_OT_swap_asset_version(Operator):
             is_target_collection = isinstance(tandem_data_block, bpy.types.Collection)
             
             if is_target_collection:
-                # Dynamically determine if the target should be an Override
-                # by checking if it contains an overridable root ('emp' or 'arm')
+                # Broad root matching to enforce override handling on custom layouts
                 has_override_root = False
                 for t_obj in tandem_data_block.all_objects:
-                    base_name = t_obj.name.split('.')[0].lower()
-                    if base_name.endswith("emp") or base_name.endswith("arm"):
+                    if t_obj.type in {'ARMATURE', 'EMPTY'} or t_obj.name.lower().endswith(('emp', 'arm', 'empty', 'armature')):
                         has_override_root = True
                         break
                 
-                if has_override_root:
+                if is_source_override or has_override_root:
                     is_target_override = True
                 else:
                     is_target_empty = True
@@ -1038,17 +1007,12 @@ class MY_OT_swap_asset_version(Operator):
         is_case_C = (is_source_override and is_target_override)
         
         if is_case_A:
-            # Case A: Non-Override Proxy -> Override Master
             debug_log("Running Case A Swap: Proxy -> Override")
-            # 1. Extract
             proxy_wrapper = wrapper_obj
             new_master_coll = tandem_data_block
             
-            # Find exact parent collection of proxy within the scene hierarchy
             target_parent = get_scene_parent_collection(proxy_wrapper, context.scene)
             
-            # 2. Import & Override
-            # new_master_coll MUST be linked to the scene/parent before override can be created
             if new_master_coll.name not in target_parent.children:
                 target_parent.children.link(new_master_coll)
                 
@@ -1061,14 +1025,12 @@ class MY_OT_swap_asset_version(Operator):
             has_old_override = getattr(override_coll, 'override_library', None) is not None
             has_new_override = getattr(override_coll, 'library_override', None) is not None
             
-            # Robust verification
             is_valid_override = False
             if override_coll and (has_old_override or has_new_override):
                 prop = getattr(override_coll, 'library_override', getattr(override_coll, 'override_library', None))
                 if getattr(prop, "reference", getattr(prop, "main", None)) is not None:
                     is_valid_override = True
             
-            # Clean up the base linked collection immediately so it doesn't leave a ghost linked duplicate
             try: target_parent.children.unlink(new_master_coll)
             except: pass
             if context.scene.collection != target_parent:
@@ -1076,23 +1038,22 @@ class MY_OT_swap_asset_version(Operator):
                 except: pass
             
             if override_coll and is_valid_override:
-                # SUCCESS: True Override Collection
                 if override_coll.name not in target_parent.children:
                     target_parent.children.link(override_coll)
                 if override_coll.name in context.scene.collection.children and target_parent != context.scene.collection:
                     context.scene.collection.children.unlink(override_coll)
                 
-                # --- APPLY FULL SUFFIX NAME ---
-                override_coll.name = final_target_name
+                # PROTECTED RENAME: Bypasses read-only name locks silently
+                try:
+                    override_coll.name = final_target_name
+                except Exception as e:
+                    debug_log(f"Rename bypassed for collection override block: {e}")
 
-                # 4. Paste
                 root_objects = find_root_objects(override_coll)
                 if isinstance(proxy_wrapper, bpy.types.Object):
-                    # Simple paste from Empty
                     for root_obj in root_objects:
                         copy_transforms(proxy_wrapper, root_obj)
                 else:
-                    # Proxy is a Collection, find its roots and copy from them
                     proxy_roots = find_root_objects(proxy_wrapper)
                     if len(proxy_roots) == 1 and len(root_objects) == 1:
                         copy_transforms(proxy_roots[0], root_objects[0])
@@ -1104,14 +1065,11 @@ class MY_OT_swap_asset_version(Operator):
                                     copy_transforms(old_rot, new_rot)
                                     break
             else:
-                # FAILURE: Target rejected override status.
-                # Fallback to Case B: Spawn an Empty Container Instance instead.
                 debug_log("Master target rejected override status. Falling back to Case B Empty Instancing.")
                 if override_coll and override_coll != new_master_coll:
                     try: bpy.data.collections.remove(override_coll, do_unlink=True)
                     except: pass
                 
-                # --- APPLY FULL SUFFIX NAME ON CREATION ---
                 new_empty = bpy.data.objects.new(final_target_name, None)
                 new_empty.instance_type = 'COLLECTION'
                 new_empty.instance_collection = new_master_coll
@@ -1124,7 +1082,6 @@ class MY_OT_swap_asset_version(Operator):
                     if proxy_roots:
                         copy_transforms(proxy_roots[0], new_empty)
                 
-            # 5. Remove
             instance_coll_to_remove = None
             if isinstance(proxy_wrapper, bpy.types.Object) and proxy_wrapper.type == 'EMPTY':
                 instance_coll_to_remove = proxy_wrapper.instance_collection
@@ -1133,31 +1090,23 @@ class MY_OT_swap_asset_version(Operator):
                 bpy.data.objects.remove(proxy_wrapper, do_unlink=True)
             else:
                 purge_override_hierarchy(proxy_wrapper)
-                # Ensure the root wrapper itself is gone from blender data
                 if proxy_wrapper.name in bpy.data.collections:
-                    try:
-                        bpy.data.collections.remove(proxy_wrapper, do_unlink=True)
-                    except Exception as e:
-                        debug_log(f"Final override purge fallback failed: {e}")
+                    try: bpy.data.collections.remove(proxy_wrapper, do_unlink=True)
+                    except: pass
             
-            # Safely purge the underlying instanced collection ONLY if no other objects are using it
+            # PRESERVE SHARED PRODUCTION LIBRARIES: Never drop network assets out of active layer sessions
             if instance_coll_to_remove and instance_coll_to_remove.name in bpy.data.collections:
-                if instance_coll_to_remove.users == 0:
-                    debug_log(f"Purging shared instance collection '{instance_coll_to_remove.name}' (0 users remaining).")
+                if instance_coll_to_remove.library is None and instance_coll_to_remove.users == 0:
+                    debug_log(f"Purging shared local layout instance collection: {instance_coll_to_remove.name}")
                     purge_override_hierarchy(instance_coll_to_remove)
-                else:
-                    debug_log(f"Preserving shared instance collection '{instance_coll_to_remove.name}' ({instance_coll_to_remove.users} users remaining for batch swap).")
             
         elif is_case_B:
-            # Case B: Override Master -> Non-Override Proxy
             debug_log("Running Case B Swap: Override -> Empty")
             old_master_coll = details['base_data_block']
             new_proxy_coll = tandem_data_block
             
-            # Find parent collection of the old master override
             target_parent = get_scene_parent_collection(old_master_coll, context.scene)
             
-            # 1. Extract
             root_objects = find_root_objects(old_master_coll)
             saved_loc, saved_rot_e, saved_rot_q, saved_scale = None, None, None, None
             if root_objects:
@@ -1166,37 +1115,27 @@ class MY_OT_swap_asset_version(Operator):
                 saved_rot_q = root_objects[0].rotation_quaternion.copy()
                 saved_scale = root_objects[0].scale.copy()
             
-            # 2. Import & Construct Empty
-            # --- APPLY FULL SUFFIX NAME ON CREATION ---
             new_empty = bpy.data.objects.new(final_target_name, None)
             new_empty.instance_type = 'COLLECTION'
             new_empty.instance_collection = new_proxy_coll
             target_parent.objects.link(new_empty)
             
-            # 4. Paste
             if saved_loc:
                 new_empty.location = saved_loc
                 new_empty.rotation_euler = saved_rot_e
                 new_empty.rotation_quaternion = saved_rot_q
                 new_empty.scale = saved_scale
                 
-            # 5. Thorough Remove
             purge_override_hierarchy(old_master_coll)
             
         elif is_case_C:
-            # Case C: Override Master -> Override Master
-            debug_log("Running Case C Swap: Override -> Override (with Empty Fallback)")
+            debug_log("Running Case C Swap: Override -> Override")
             old_master_coll = details['base_data_block']
             new_master_coll = tandem_data_block
             
-            # Find parent collection
             target_parent = get_scene_parent_collection(old_master_coll, context.scene)
-            
-            # 1. Extract
             old_roots = find_root_objects(old_master_coll)
             
-            # 2. Import & Override
-            # new_master_coll MUST be linked to the scene/parent before override can be created
             if new_master_coll.name not in target_parent.children:
                 target_parent.children.link(new_master_coll)
                 
@@ -1206,18 +1145,15 @@ class MY_OT_swap_asset_version(Operator):
             except Exception as e:
                 debug_log(f"Override hierarchy creation failed/rejected: {e}")
                 
-            # Verify it actually produced an override (Blender can silently return linked collections)
             has_old_override = getattr(override_coll, 'override_library', None) is not None
             has_new_override = getattr(override_coll, 'library_override', None) is not None
             
-            # Robust verification: It must have a 'reference' or 'main' indicating a true override link
             is_valid_override = False
             if override_coll and (has_old_override or has_new_override):
                 prop = getattr(override_coll, 'library_override', getattr(override_coll, 'override_library', None))
                 if getattr(prop, "reference", getattr(prop, "main", None)) is not None:
                     is_valid_override = True
             
-            # Clean up the base linked collection immediately so it doesn't leave a ghost linked duplicate
             try: target_parent.children.unlink(new_master_coll)
             except: pass
             if context.scene.collection != target_parent:
@@ -1225,22 +1161,21 @@ class MY_OT_swap_asset_version(Operator):
                 except: pass
             
             if override_coll and is_valid_override:
-                # SUCCESS: True Override Collection
                 if override_coll.name not in target_parent.children:
                     target_parent.children.link(override_coll)
                 if override_coll.name in context.scene.collection.children and target_parent != context.scene.collection:
                     context.scene.collection.children.unlink(override_coll)
                 
-                # --- APPLY FULL SUFFIX NAME ---
-                override_coll.name = final_target_name
+                # PROTECTED RENAME: Safe layout check
+                try:
+                    override_coll.name = final_target_name
+                except Exception as e:
+                    debug_log(f"Rename bypassed for collection override block (Case C): {e}")
 
-                # 4. Paste
                 new_roots = find_root_objects(override_coll)
                 if len(old_roots) == 1 and len(new_roots) == 1:
                     copy_transforms(old_roots[0], new_roots[0])
                 elif len(old_roots) == 1 and len(new_roots) > 1:
-                    # Asymmetrical Root Fallback: Master has 1 armature, Proxy has multiple decoupled meshes
-                    debug_log("Asymmetrical root mapping detected. Applying primary transform to all new roots.")
                     for new_rot in new_roots:
                         copy_transforms(old_roots[0], new_rot)
                 else:
@@ -1251,14 +1186,11 @@ class MY_OT_swap_asset_version(Operator):
                                 copy_transforms(old_rot, new_rot)
                                 break
             else:
-                # FAILURE: Target rejected override status.
-                # Fallback to Case B: Spawn an Empty Container Instance instead.
                 debug_log("Target rejected override status. Falling back to Case B Empty Instancing.")
                 if override_coll and override_coll != new_master_coll:
                     try: bpy.data.collections.remove(override_coll, do_unlink=True)
                     except: pass
                 
-                # --- APPLY FULL SUFFIX NAME ON CREATION ---
                 new_empty = bpy.data.objects.new(final_target_name, None)
                 new_empty.instance_type = 'COLLECTION'
                 new_empty.instance_collection = new_master_coll
@@ -1267,21 +1199,24 @@ class MY_OT_swap_asset_version(Operator):
                 if old_roots:
                     copy_transforms(old_roots[0], new_empty)
                         
-            # 5. Thorough Remove
             purge_override_hierarchy(old_master_coll)
 
         else:
-            # --- EXACTLY THE OLD LOGIC (Fallback for standard assets) ---
+            # --- Standard Datablock Fallback (Meshes, Cameras, Armatures, Lights) ---
             if isinstance(wrapper_obj, bpy.types.Collection):
-                # If we reached here with a Collection, it means it's an Override Swap
-                # that somehow missed Case A/B/C. We cannot 'setattr' on a Collection to swap it.
-                # It MUST be handled by the override logic. 
                 raise Exception(f"Cannot perform simple property swap on Collection '{wrapper_obj.name}'. Edge-case interceptor bypassed incorrectly.")
             else:
                 debug_log(f"Setting {wrapper_obj.name}.{swap_prop} = {tandem_data_block.name}")
                 setattr(wrapper_obj, swap_prop, tandem_data_block)
-                # --- APPLY FULL SUFFIX NAME ---
-                wrapper_obj.name = final_target_name
+                
+                # PROTECTED RENAME: Swaps successfully even if renaming raises attribute errors on linked items
+                try:
+                    wrapper_obj.name = final_target_name
+                except AttributeError:
+                    debug_log(f"Renaming locked for read-only datablock asset wrapper: {wrapper_obj.name}")
+                except Exception as e:
+                    debug_log(f"Renaming bypassed due to unexpected error: {e}")
+                    
                 wrapper_obj.update_tag()
 
 

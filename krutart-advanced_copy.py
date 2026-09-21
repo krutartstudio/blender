@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Krutart Advanced Copy",
     "author": "iori, Krutart, Gemini",
-    "version": (2, 6, 3), 
+    "version": (2, 6, 8), 
     "blender": (4, 2, 0),
     "location": "Outliner > Right-Click Menu, 3D View > 'N' Panel > Layout Suite",
     "description": "Provides specific hierarchy traversal copy/move functionalities with dynamic, high-performance, shot-based collection visibility. Correctly duplicates overrides (not-localize) and fixes visibility cache bugs from ENV/LOC operations.",
@@ -127,6 +127,205 @@ def _collect_all_items_recursive(collection, collected_items_set):
         log.warning(f"ReferenceError while scanning collection '{collection.name}'. It may be broken or deleted.")
 
 
+# --- Active Scenic Original and Segregation Audit Helpers ---
+
+def get_all_linked_scene_collections(scene):
+    """Recursively collects all collections linked under the scene's master collection."""
+    linked = set()
+    def _traverse(coll):
+        linked.add(coll)
+        for child in coll.children:
+            _traverse(child)
+    if scene and scene.collection:
+        _traverse(scene.collection)
+    return linked
+
+def is_scenic_original(item, parent_map=None):
+    """
+    Checks if a collection or object is a scenic original (part of the build hierarchy).
+    It is a scenic original if it is not inside any shot collection hierarchy.
+    """
+    if parent_map is None:
+        parent_map = {}
+        for parent in bpy.data.collections:
+            for child in parent.children:
+                if child not in parent_map:
+                    parent_map[child] = []
+                parent_map[child].append(parent)
+
+    if isinstance(item, bpy.types.Object):
+        start_colls = list(item.users_collection)
+    elif isinstance(item, bpy.types.Collection):
+        start_colls = [item]
+    else:
+        return False
+
+    shot_pattern = re.compile(r"^(SHOT-|MODEL-SC\d+-SH\d+|CAM-SC\d+-SH\d+|VFX-SC\d+-SH\d+|PRP-SC\d+-SH\d+)", re.IGNORECASE)
+
+    visited = set()
+    stack = list(start_colls)
+    while stack:
+        current = stack.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+
+        if shot_pattern.match(current.name):
+            return False
+
+        if current in parent_map:
+            stack.extend(parent_map[current])
+
+    if isinstance(item, bpy.types.Collection) and shot_pattern.match(item.name):
+        return False
+
+    return True
+
+def is_active_scenic_original(item, scene, parent_map=None, linked_colls=None):
+    """Returns True if the item is a scenic original AND is actively linked in the scene."""
+    if not is_scenic_original(item, parent_map=parent_map):
+        return False
+    
+    if linked_colls is None:
+        linked_colls = get_all_linked_scene_collections(scene)
+    if isinstance(item, bpy.types.Collection):
+        return item in linked_colls
+    elif isinstance(item, bpy.types.Object):
+        return any(c in linked_colls for c in item.users_collection)
+    return False
+
+def is_active_shot_copy(item, scene, parent_map=None, linked_colls=None):
+    """Returns True if the item is inside a shot collection hierarchy AND is actively linked in the scene."""
+    if is_scenic_original(item, parent_map=parent_map):
+        return False
+    
+    if linked_colls is None:
+        linked_colls = get_all_linked_scene_collections(scene)
+    if isinstance(item, bpy.types.Collection):
+        return item in linked_colls
+    elif isinstance(item, bpy.types.Object):
+        return any(c in linked_colls for c in item.users_collection)
+    return False
+
+def get_containing_collections(item, parent_map=None):
+    """Returns all collections containing the item (either directly or via parent collections)."""
+    if isinstance(item, bpy.types.Object):
+        return list(item.users_collection)
+    elif isinstance(item, bpy.types.Collection):
+        if parent_map is None:
+            parent_map = {}
+            for parent in bpy.data.collections:
+                for child in parent.children:
+                    if child not in parent_map:
+                        parent_map[child] = []
+                    parent_map[child].append(parent)
+        
+        visited = set()
+        stack = list(parent_map.get(item, []))
+        parents = []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            parents.append(current)
+            if current in parent_map:
+                stack.extend(parent_map[current])
+        return parents
+    return []
+
+def get_item_approx_location(item):
+    """Gets the world location (or average object location) of the item."""
+    import mathutils
+    if isinstance(item, bpy.types.Object):
+        return item.matrix_world.to_translation()
+    elif isinstance(item, bpy.types.Collection):
+        locs = [obj.matrix_world.to_translation() for obj in item.objects if obj.type in {'MESH', 'EMPTY'}]
+        if not locs:
+            for child in item.children:
+                locs.extend([obj.matrix_world.to_translation() for obj in child.objects if obj.type in {'MESH', 'EMPTY'}])
+        if locs:
+            return sum(locs, mathutils.Vector()) / len(locs)
+    return mathutils.Vector((0, 0, 0))
+
+def resolve_best_original_candidate(shot_item, candidates, copy_map, scene, parent_map=None):
+    """
+    Resolves the single best original candidate for a shot item using hierarchical,
+    spatial, and alphabetical sorting tiers.
+    """
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # --- Tier 1: Hierarchical Context (Parent Collection Mapping) ---
+    shot_parents = [c for c in get_containing_collections(shot_item, parent_map=parent_map) if is_active_shot_copy(c, scene, parent_map=parent_map)]
+    mapped_orig_parents = []
+    for sp in shot_parents:
+        orig_parent_name = copy_map.get(sp.name)
+        if orig_parent_name:
+            orig_parent = bpy.data.collections.get(orig_parent_name)
+            if orig_parent:
+                mapped_orig_parents.append(orig_parent)
+
+    if mapped_orig_parents:
+        hierarchical_candidates = []
+        for cand in candidates:
+            cand_parents = get_containing_collections(cand, parent_map=parent_map)
+            if any(op in cand_parents for op in mapped_orig_parents):
+                hierarchical_candidates.append(cand)
+        if len(hierarchical_candidates) == 1:
+            return hierarchical_candidates[0]
+        elif len(hierarchical_candidates) > 1:
+            candidates = hierarchical_candidates
+
+    # --- Tier 2: Spatial Proximity ---
+    try:
+        shot_loc = get_item_approx_location(shot_item)
+        candidates.sort(key=lambda c: (get_item_approx_location(c) - shot_loc).length)
+        return candidates[0]
+    except Exception as e:
+        log.debug(f"Spatial proximity sorting failed: {e}")
+
+    # --- Tier 3: Alphabetical/Suffix Suffix Sorting ---
+    candidates.sort(key=lambda c: c.name)
+    return candidates[0]
+
+def audit_shot_scene_duplicates(scene):
+    """
+    Audits the active scene to detect if any datablock (Object or Collection)
+    is incorrectly shared between shot hierarchies and scenic original hierarchies.
+    """
+    log.info("Starting asset segregation audit...")
+    
+    # Pre-build maps for linear O(N) lookup
+    parent_map = {}
+    for parent in bpy.data.collections:
+        for child in parent.children:
+            if child not in parent_map:
+                parent_map[child] = []
+            parent_map[child].append(parent)
+            
+    linked_colls = get_all_linked_scene_collections(scene)
+    
+    shared_collections = []
+    for coll in bpy.data.collections:
+        if is_active_scenic_original(coll, scene, parent_map=parent_map, linked_colls=linked_colls) and is_active_shot_copy(coll, scene, parent_map=parent_map, linked_colls=linked_colls):
+            shared_collections.append(coll.name)
+            
+    shared_objects = []
+    for obj in bpy.data.objects:
+        if is_active_scenic_original(obj, scene, parent_map=parent_map, linked_colls=linked_colls) and is_active_shot_copy(obj, scene, parent_map=parent_map, linked_colls=linked_colls):
+            shared_objects.append(obj.name)
+            
+    if shared_collections:
+        log.warning(f"CRITICAL: Shared Collections found in both shot and scene paths: {shared_collections}")
+    if shared_objects:
+        log.warning(f"CRITICAL: Shared Objects found in both shot and scene paths: {shared_objects}")
+        
+    return shared_collections, shared_objects
+
+
 @persistent
 def build_visibility_data(scene):
     """
@@ -161,9 +360,8 @@ def build_visibility_data(scene):
     # 1. Load our persistent 1-to-1 map
     # This map is {"shot_copy_name": "original_name", ...}
     copy_map = load_copy_map()
-    if not copy_map:
-        log.warning("Visibility map is empty. No originals will be hidden.")
-        return
+    copy_map_updated = False
+    suffix_pattern = re.compile(r"^(.*?)\.(\d{3})$")
 
     # 2. Build a simple cache of all data.blocks by their *full name*.
     #    We only cache the *originals* we need, as defined in our map.
@@ -176,7 +374,17 @@ def build_visibility_data(scene):
         else:
             log.debug(f"Persistent map references original '{name}', but it's not in the scene. Will be ignored.")
 
-    # 3. Scan shot collections and map them to originals using our new map
+    # Pre-build maps for performance
+    parent_map = {}
+    for parent in bpy.data.collections:
+        for child in parent.children:
+            if child not in parent_map:
+                parent_map[child] = []
+            parent_map[child].append(parent)
+            
+    linked_colls = get_all_linked_scene_collections(scene)
+
+    # 3. Scan shot collections and map them to originals using our map
     for shot_coll in get_all_shot_collections():
         coll_shot_id = get_shot_identifier(shot_coll.name)
         if not coll_shot_id:
@@ -190,9 +398,44 @@ def build_visibility_data(scene):
             # Use our persistent map to find the original's name (1-to-1)
             original_item_name = copy_map.get(shot_item.name)
             
+            # Verify if the mapped original is active in the scene hierarchy.
+            # If it is not active or doesn't exist, we invalidate original_item_name to force self-healing.
             if original_item_name:
-                # Find the original item from our new cache
                 original_item = original_items_cache.get(original_item_name)
+                if not original_item:
+                    original_item = bpy.data.objects.get(original_item_name) or bpy.data.collections.get(original_item_name)
+                if not original_item or not is_active_scenic_original(original_item, scene, parent_map=parent_map, linked_colls=linked_colls):
+                    original_item_name = None
+            
+            # --- SELF-HEALING / RECOVERY FALLBACK ---
+            if not original_item_name:
+                match = suffix_pattern.match(shot_item.name)
+                if match:
+                    base_name = match.group(1)
+                    candidates = []
+                    if isinstance(shot_item, bpy.types.Object):
+                        candidates = [obj for obj in bpy.data.objects 
+                                      if (obj.name == base_name or obj.name.startswith(base_name + "."))
+                                      and is_active_scenic_original(obj, scene, parent_map=parent_map, linked_colls=linked_colls)]
+                    elif isinstance(shot_item, bpy.types.Collection):
+                        candidates = [coll for coll in bpy.data.collections 
+                                      if (coll.name == base_name or coll.name.startswith(base_name + "."))
+                                      and is_active_scenic_original(coll, scene, parent_map=parent_map, linked_colls=linked_colls)]
+                    
+                    best_candidate = resolve_best_original_candidate(shot_item, candidates, copy_map, scene, parent_map=parent_map)
+                    if best_candidate:
+                        original_item_name = best_candidate.name
+                        copy_map[shot_item.name] = best_candidate.name
+                        copy_map_updated = True
+                        log.info(f"Self-healed copy mapping: '{shot_item.name}' -> '{best_candidate.name}'")
+            
+            if original_item_name:
+                # Find the original item from cache, or cache dynamically if self-healed
+                original_item = original_items_cache.get(original_item_name)
+                if not original_item:
+                    original_item = bpy.data.objects.get(original_item_name) or bpy.data.collections.get(original_item_name)
+                    if original_item:
+                        original_items_cache[original_item_name] = original_item
                 
                 if original_item:
                     # We found a valid shot_item -> original_item link
@@ -202,6 +445,9 @@ def build_visibility_data(scene):
                     if original_item not in originals_to_hide_map[coll_shot_id]:
                         originals_to_hide_map[coll_shot_id].add(original_item)
                         log.debug(f"Mapped shot item '{shot_item.name}' to original '{original_item.name}' for shot {coll_shot_id}")
+                        
+    if copy_map_updated:
+        save_copy_map(copy_map)
     
     # --- End of New Logic ---
 
@@ -237,6 +483,10 @@ def set_item_visibility(view_layer, item, visible):
             return
             
         if isinstance(item, bpy.types.Object):
+            # Check if it is read-only linked library data
+            if item.library and not item.override_library:
+                log.debug(f"Skipping visibility set for read-only linked object '{item_name}' (handled via collection exclusion).")
+                return
             # Use hide_set() for objects, as it's the modern, correct method.
             if item.hide_get() == visible:
                 item.hide_set(not visible)
@@ -268,9 +518,12 @@ def set_item_visibility(view_layer, item, visible):
                 log.debug(f"Could not find a 'build' instance for collection '{item_name}' to hide/unhide.")
             # --- END MODIFIED LOGIC ---
             
-    except (ReferenceError, RuntimeError):
-        # Item might have been deleted during the operation itself
-        log.warning(f"Could not set visibility for '{item_name}'. It became invalid.")
+    except (ReferenceError, RuntimeError) as e:
+        # If it's a read-only or invalid link error, log as debug
+        if "read-only" in str(e).lower() or "is_library" in str(e).lower():
+            log.debug(f"Could not set visibility for '{item_name}' (read-only): {e}")
+        else:
+            log.warning(f"Could not set visibility for '{item_name}'. It became invalid: {e}")
 
 @persistent
 def on_frame_change_update_visibility(scene, depsgraph=None):
@@ -288,7 +541,12 @@ def on_frame_change_update_visibility(scene, depsgraph=None):
         return
 
     if scene.name != cached_scene_name:
-        build_visibility_data(scene)
+        # Clear the caches so we don't apply visibility maps from a different scene
+        shot_switch_map.clear()
+        originals_to_hide_map.clear()
+        original_items_cache.clear()
+        cached_scene_name = None
+        return
 
     if not shot_switch_map:
         return
@@ -384,110 +642,52 @@ def copy_collection_hierarchy(original_coll, target_parent_coll, name_suffix="")
     # MODIFIED (Phase 2): Renamed object_map to item_map
     item_map = {}  # Maps original item -> new item (objects AND collections)
 
-    # --- MODIFICATION START (VERSION 2.5.3) ---
-    # This new helper function just *maps* an existing override hierarchy
-    # that was created by .copy(). It does *not* link anything.
-    def _map_copied_override_hierarchy(source_coll, new_coll, item_map): # MODIFIED: item_map
-        """
-        Recursively maps objects and collections from a source override hierarchy
-        to a new override hierarchy that was just created via .copy().
-        This is used to populate the item_map for relationship remapping.
-        """
-        # MODIFIED (Phase 2): Map collection itself and prevent re-mapping
-        if source_coll in item_map:
-            return # Already mapped
-        item_map[source_coll] = new_coll
-        log.debug(f"  Mapped orig coll '{source_coll.name}' to new '{new_coll.name}'")
-
-        # 1. Map objects
-        if len(source_coll.objects) == len(new_coll.objects):
-            for i, orig_obj in enumerate(source_coll.objects):
-                if orig_obj not in item_map:
-                    new_obj = new_coll.objects[i]
-                    item_map[orig_obj] = new_obj # MODIFIED: item_map
-                    log.debug(f"  Mapped orig obj '{orig_obj.name}' to new '{new_obj.name}'")
-        else:
-            log.warning(f"Object count mismatch in override map: '{source_coll.name}' ({len(source_coll.objects)}) vs '{new_coll.name}' ({len(new_coll.objects)}). Relationship remapping may fail.")
-            
-        # 2. Map child collections and recurse
-        if len(source_coll.children) == len(new_coll.children):
-            for i, orig_child_coll in enumerate(source_coll.children):
-                new_child_coll = new_coll.children[i]
-                # Recurse into the child hierarchy
-                # MODIFIED: pass item_map
-                _map_copied_override_hierarchy(orig_child_coll, new_child_coll, item_map)
-        else:
-             log.warning(f"Collection count mismatch in override map: '{source_coll.name}' ({len(source_coll.children)}) vs '{new_coll.name}' ({len(new_coll.children)}). Relationship remapping may fail.")
-    # --- END NEW HELPER ---
-
-    def _recursive_copy_and_map(source_coll, target_parent, suffix, item_map): # MODIFIED: item_map
+    def _recursive_copy_and_map(source_coll, target_parent, suffix, item_map):
         # The 'suffix' parameter is no longer used, but kept for call signature.
         
-        # --- MODIFICATION START (VERSION 2.5.3) ---
-        # Logic is now split. We handle overrides and regular collections differently.
-        
         if source_coll.override_library:
-            # --- This is an OVERRIDE ---
-            # Use source_coll.copy() to create a new, duplicate override.
-            # This single command copies the *entire* internal hierarchy.
-            log.debug(f"Copying '{source_coll.name}' as a new override.")
+            log.debug(f"Copying '{source_coll.name}' as a new override collection.")
             new_coll = source_coll.copy()
             
-            # 2. Link the new *top-level* collection to its new parent.
-            target_parent.children.link(new_coll)
-            
-            # 3. FIX: Recursively *map* (don't copy/link) the entire
-            #    hierarchy that .copy() just created so we can remap
-            #    relationships later.
-            log.debug(f"Populating item map from new override hierarchy '{new_coll.name}'...")
-            # MODIFIED: pass item_map
-            _map_copied_override_hierarchy(source_coll, new_coll, item_map)
-            # We are DONE. We do not recurse further to link anything.
-
+            # Since .copy() on a collection references the same objects and children,
+            # we must unlink them from the copy so we can link newly duplicated ones instead.
+            for obj in list(new_coll.objects):
+                new_coll.objects.unlink(obj)
+            for child in list(new_coll.children):
+                new_coll.children.unlink(child)
         else:
-            # --- This is a REGULAR, non-overridden collection ---
-            # Use the original deep-copy (localization) logic.
             log.debug(f"Deep-copying '{source_coll.name}' as a new collection.")
-            new_coll_name = source_coll.name # Preserve name
-            new_coll = bpy.data.collections.new(new_coll_name)
-            
-            # MODIFIED (Phase 2): Map the collection itself
-            item_map[source_coll] = new_coll
-
-            # 2. Link the new collection to its new parent in the hierarchy.
-            target_parent.children.link(new_coll)
+            new_coll = bpy.data.collections.new(source_coll.name)
             new_coll.color_tag = source_coll.color_tag
-            
-            # 3. (Original Logic) Deep copy all objects from the source collection.
-            for obj in source_coll.objects:
-                if obj not in item_map: # MODIFIED: item_map
-                    new_obj = obj.copy()  # This correctly creates a new override if obj is one.
-                    if obj.data:
-                        # This also correctly creates a new override if data is one.
+        
+        # Map the collection itself
+        item_map[source_coll] = new_coll
+        
+        # Link the new collection to its parent
+        target_parent.children.link(new_coll)
+        
+        # Deep copy all objects from the source collection
+        for obj in source_coll.objects:
+            if obj not in item_map:
+                new_obj = obj.copy()
+                if obj.data:
+                    try:
                         new_obj.data = obj.data.copy()
-
-                    # --- THIS IS THE FIX ---
-                    # Preserve the original name for all objects.
-                    new_obj.name = obj.name  
-                    # --- END FIX ---
-                    
-                    item_map[obj] = new_obj  # MODIFIED: item_map. Store the mapping
-
-            # 4. (Original Logic) Link the newly created deep-copied objects to our new collection.
-            #    This is SAFE because new_coll is NOT an override.
-            for obj in source_coll.objects:
-                new_obj = item_map.get(obj) # MODIFIED: item_map
-                if new_obj and new_obj.name not in new_coll.objects:
-                    new_coll.objects.link(new_obj)
-
-            # 5. Recurse for all child collections.
-            #    This ONLY happens for regular (non-override) collections.
-            for child in source_coll.children:
-                # MODIFIED: pass item_map
-                _recursive_copy_and_map(child, new_coll, suffix, item_map)
-
-        # --- END OF MODIFICATION (VERSION 2.5.3) ---
-
+                    except Exception as e:
+                        log.debug(f"Could not copy data block for '{obj.name}': {e}")
+                new_obj.name = obj.name  # Preserve original name (Blender suffixes automatically)
+                item_map[obj] = new_obj
+                
+        # Link the newly created copied objects to the new collection
+        for obj in source_coll.objects:
+            new_obj = item_map.get(obj)
+            if new_obj and new_obj.name not in new_coll.objects:
+                new_coll.objects.link(new_obj)
+                
+        # Recurse for all child collections
+        for child in source_coll.children:
+            _recursive_copy_and_map(child, new_coll, suffix, item_map)
+            
         return new_coll
     # --- End of _recursive_copy_and_map helper function ---
 
@@ -547,43 +747,38 @@ def is_in_build_hierarchy(layer_coll):
     Checks if a LayerCollection is part of an 'original' hierarchy,
     i.e., NOT part of a 'shot' hierarchy (MODEL-SC##-SH###, etc.).
     """
-    # --- MODIFICATION START ---
-    # --- MODIFIED --- Added 'PRP' to the pattern
+    parent_map = {}
+    def _build(lc):
+        for child in lc.children:
+            parent_map[child] = lc
+            _build(child)
+            
+    _build(bpy.context.view_layer.layer_collection)
+    
     shot_pattern = re.compile(r"^(MODEL|CAM|VFX|PRP)-SC\d+-SH\d+$", re.IGNORECASE)
     current = layer_coll
-    
-    # Check self and parents
     while current:
         if current.collection and shot_pattern.match(current.collection.name):
-            # It's inside a shot collection, so it's NOT an original "build" instance.
             return False
-        
-        # --- FIX --- (This fix was already present)
-        # Check if current has a parent attribute before accessing it.
-        # The root LayerCollection (view_layer.layer_collection) does not have a .parent
-        if hasattr(current, "parent"):
-            current = current.parent
-        else:
-            # We are at the root, stop iterating.
-            current = None
-        # --- END FIX ---
-    
-    # If we reached the root and found no shot collection, it's an original.
+        current = parent_map.get(current)
     return True
-    # --- MODIFICATION END ---
 
-def find_original_layer_collection(layer_collection_root, collection_datablock):
+def find_original_layer_collection(layer_collection_root, collection_datablock, in_shot_hierarchy=False):
     """
     Recursively finds the LayerCollection that uses collection_datablock
     AND is part of an original 'build' hierarchy.
     """
-    if layer_collection_root.collection == collection_datablock:
-        if is_in_build_hierarchy(layer_collection_root):
-            return layer_collection_root
-        # If not in build hierarchy, it's a shot-copy. Ignore it and keep searching.
+    shot_pattern = re.compile(r"^(MODEL|CAM|VFX|PRP)-SC\d+-SH\d+$", re.IGNORECASE)
+    
+    current_in_shot = in_shot_hierarchy
+    if layer_collection_root.collection and shot_pattern.match(layer_collection_root.collection.name):
+        current_in_shot = True
+
+    if layer_collection_root.collection == collection_datablock and not current_in_shot:
+        return layer_collection_root
     
     for child in layer_collection_root.children:
-        found = find_original_layer_collection(child, collection_datablock)
+        found = find_original_layer_collection(child, collection_datablock, current_in_shot)
         if found:
             return found
     return None
@@ -1075,7 +1270,15 @@ class ADVCOPY_OT_rebuild_visibility_cache(bpy.types.Operator):
 
     def execute(self, context):
         log.info("Manual cache rebuild requested.")
-        build_visibility_data(context.scene)
+        scene = context.scene
+        
+        # Run asset segregation audit
+        shared_colls, shared_objs = audit_shot_scene_duplicates(scene)
+        if shared_colls or shared_objs:
+            self.report({'WARNING'}, "Segregation Audit Warning: Shared datablocks detected! Check system console.")
+            
+        build_visibility_data(scene)
+        on_frame_change_update_visibility(scene)
         self.report({'INFO'}, "Visibility cache has been rebuilt.")
         return {'FINISHED'}
 
@@ -1300,12 +1503,7 @@ def register():
     
     if on_frame_change_update_visibility not in bpy.app.handlers.frame_change_pre:
         bpy.app.handlers.frame_change_pre.append(on_frame_change_update_visibility)
-    if build_visibility_data_on_load not in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.append(build_visibility_data_on_load)
-        
-    # Register a timer to build the cache shortly after startup
-    # This avoids the context error that happens if we call it directly during register
-    bpy.app.timers.register(initialize_visibility_cache, first_interval=0.5)
+    # Automatic caching removed per user performance request
 
     bpy.types.OUTLINER_MT_collection.append(add_context_menus)
     bpy.types.OUTLINER_MT_object.append(add_context_menus)

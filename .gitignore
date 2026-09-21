@@ -1,0 +1,13 @@
+# Blender Addon GitIgnore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+*.blend1
+*.blend2
+*.zip
+DEVELOPMENT/
+OPTIONAL/
+*.log
+.entire/

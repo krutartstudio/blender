@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Krutart Addon Configurator",
     "author": "iori, Krutart, Gemini",
-    "version": (2, 0, 2), 
+    "version": (2, 0, 5), 
     "blender": (4, 5, 0),
     "location": "Preferences > Add-ons",
     "description": "Enforces company standards, manages assets, logs save history, and synchronizes company addons.",
@@ -10,6 +10,7 @@ bl_info = {
     "category": "System",
 }
 
+import json
 import bpy
 import os
 import shutil
@@ -240,55 +241,76 @@ def load_identity_map():
     """
     Parses the text file at WORKSTATION_ID_FILE.
     Expected format lines: "hostname": "artistname",
+    Falls back to Blender's local Addon Preferences cache if network fails.
     """
     global CACHED_IDENTITY_MAP
     new_map = {}
     
-    id_file = get_workstation_id_file()
-    if not id_file or not id_file.exists():
-        print(f"[Krutart] Identifier file not found: {id_file}")
-        return False
-
+    # Safely retrieve preferences
+    addon_prefs = None
     try:
-        # Cache Busting: Force OS to check metadata
+        addon_prefs = bpy.context.preferences.addons[__name__].preferences
+    except (KeyError, AttributeError):
+        pass
+
+    id_file = get_workstation_id_file()
+    network_success = False
+
+    if id_file and id_file.exists():
         try:
-            id_file.stat()
-        except OSError:
-            pass
+            # Cache Busting: Force OS to check metadata
+            try:
+                id_file.stat()
+            except OSError:
+                pass
 
-        with open(id_file, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+            with open(id_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
 
+            for line in lines:
+                clean_line = line.strip()
+                # Skip comments or empty lines
+                if not clean_line or clean_line.startswith('#') or clean_line.startswith('//'):
+                    continue
+                
+                # Simple string parsing for format: "key": "value",
+                if ':' in clean_line:
+                    parts = clean_line.split(':', 1) # Split only on first colon
+                    if len(parts) == 2:
+                        # Strip quotes, commas, and whitespace
+                        raw_host = parts[0].strip().strip('"\'').lower()
+                        raw_name = parts[1].strip().strip('"\' ,')
+                        
+                        if raw_host and raw_name:
+                            new_map[raw_host] = raw_name
             
-        for line in lines:
-            clean_line = line.strip()
-            # Skip comments or empty lines
-            if not clean_line or clean_line.startswith('#') or clean_line.startswith('//'):
-                continue
-            
-            # Simple string parsing for format: "key": "value",
-            if ':' in clean_line:
-                parts = clean_line.split(':', 1) # Split only on first colon
-                if len(parts) == 2:
-                    # Strip quotes, commas, and whitespace
-                    raw_host = parts[0].strip().strip('"\'').lower()
-                    raw_name = parts[1].strip().strip('"\' ,')
-                    
-                    if raw_host and raw_name:
-                        new_map[raw_host] = raw_name
-        
+            if new_map:
+                network_success = True
+                if addon_prefs:
+                    addon_prefs.cached_identity_data = json.dumps(new_map)
+
+        except (OSError, IOError) as e:
+            print(f"[Krutart] TIMEOUT/IO ERROR loading identity map from network: {e}")
+            print("  > Try: Right-click '3212-PREPRODUCTION/MISC' > 'Make Available Offline'")
+        except Exception as e:
+            print(f"[Krutart] Error loading identity map: {e}")
+
+    # Fallback to local preferences cache if network read failed
+    if not network_success and addon_prefs and addon_prefs.cached_identity_data:
+        try:
+            fallback_map = json.loads(addon_prefs.cached_identity_data)
+            if fallback_map:
+                new_map = fallback_map
+                print(f"[Krutart] Loaded {len(fallback_map)} entries from local Addon Preferences cache.")
+        except Exception as e:
+            print(f"[Krutart] Failed to parse local preferences identity cache: {e}")
+
+    if new_map:
         CACHED_IDENTITY_MAP = new_map
         print(f"[Krutart] Identity Map Loaded ({len(new_map)} entries). Current Host: {get_normalized_hostname()}")
         return True
 
-
-    except (OSError, IOError) as e:
-        print(f"[Krutart] TIMEOUT/IO ERROR loading identity map: {e}")
-        print("  > Try: Right-click '3212-PREPRODUCTION/MISC' > 'Make Available Offline'")
-        return False
-    except Exception as e:
-        print(f"[Krutart] Error loading identity map: {e}")
-        return False
+    return False
 
 def append_identity_to_file(hostname, artist_name):
     """
@@ -682,6 +704,12 @@ class KrutartConfiguratorPreferences(AddonPreferences):
         description="Type your name here to override detection or to register this computer."
     )
 
+    cached_identity_data: StringProperty(
+        name="Cached Identity Data",
+        default="{}",
+        description="Internal cache of workstation identity map saved to user preferences."
+    )
+
     # --- Match OS Bridge Settings ---
     mac_root_path: StringProperty(
         name="Mac Root Override",
@@ -820,38 +848,69 @@ def on_save_pre(dummy):
 @persistent
 def on_load_post(dummy):
     """
-    Runs on file open. 
+    Runs automatically when a .blend file is opened.
+    Ensures identity map is verified on every file load.
+    Safely checks for missing library attachments without crashing the pipeline.
     """
-    # Fix Outliner for missing files (Generic helper, safe for all files)
+    global CACHED_IDENTITY_MAP
+    current_host = get_normalized_hostname()
+
+    # Re-verify identity if current workstation is unknown
+    if not CACHED_IDENTITY_MAP or current_host not in CACHED_IDENTITY_MAP:
+        load_identity_map()
+
+    has_missing = False
     
-    # Check if there are missing libraries or broken library links
-    has_missing = any(lib.filepath.startswith("//") == False and not os.path.exists(bpy.path.abspath(lib.filepath)) for lib in bpy.data.libraries)
-    
+    # Hardened check against unreadable or missing linked libraries
+    try:
+        for lib in bpy.data.libraries:
+            # Skip relative paths that haven't been resolved yet
+            if lib.filepath.startswith("//"):
+                continue
+            
+            # If the path cleanly doesn't exist on disk, mark as missing
+            try:
+                if not os.path.exists(bpy.path.abspath(lib.filepath)):
+                    has_missing = True
+                    break
+            except Exception:
+                # Catch parsing errors from missing DNA blocks/corrupted filenames
+                has_missing = True
+                break
+    except Exception as e:
+        print(f"[Krutart] Error inspecting file libraries: {e}")
+        has_missing = True
+
+    # If missing assets are identified, shift the Outliner view automatically
     if has_missing:
         print("[Krutart] Missing files detected. Switching Outliner...")
         try:
-            # We only affect the active window context for immediate visual feedback
+            # Only affect the active window context for immediate visual feedback
             for window in bpy.context.windows:
                 for area in window.screen.areas:
                     if area.type == 'OUTLINER':
                         area.spaces[0].display_mode = 'BLENDER_FILE'
                         break
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Krutart] Failed to adjust Outliner UI space: {e}")
 
 # --- Standard Setup Helpers ---
 
 def add_bookmarks():
+    """
+    Safely adds company directories to Blender's File Browser favorites.
+    Fixes the missing 'get_company_bookmarks' function bug.
+    """
     try:
         bookmarks = bpy.context.preferences.view.file_browser_favorites
         existing = [b.path for b in bookmarks]
         
-        # Use Dynamic Bookmarks
-        for path in get_company_bookmarks():
+        # FIXED: Loop directly through the defined global list COMPANY_BOOKMARKS
+        for path in COMPANY_BOOKMARKS:
             if path not in existing:
                 bookmarks.new(path)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Krutart] Error adding bookmarks: {e}")
 
 def configure_asset_libraries():
     prefs = bpy.context.preferences

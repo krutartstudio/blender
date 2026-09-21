@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Krutart Publisher",
     "author": "iori, Krutart, Gemini",
-    "version": (1, 8, 8), 
+    "version": (1, 9, 1),
     "blender": (4, 0, 0),
     "location": "Properties > Output; Dope Sheet > Sidebar > Publisher",
     "description": "Streamlines incremental saving and hero file creation with detailed logging. Syncs identity with Configurator. Stamps version info for production pipelines.",
@@ -31,7 +31,7 @@ DAB_SPREADSHEET_ID = '1HxVVFK2ixML5MHv83ZhOXrUQNsgw6rpwoWHVMm9UZJc'
 DAB_GID = '649829434'
 DAB_CSV_URL = f"https://docs.google.com/spreadsheets/d/{DAB_SPREADSHEET_ID}/export?format=csv&gid={DAB_GID}"
 # WebApp URLs - Default fallback values
-DEFAULT_SHOTLIST_URL = "https://script.google.com/macros/s/AKfycbxJm8DPQ9hw5CRg9pgsbQMEyPzl9eTVu8LFaPPUzPfx5EF5zDfL4o8apxzUXS02wShTxQ/exec"
+DEFAULT_SHOTLIST_URL = "https://script.google.com/macros/s/KRUTART_REDACTED_APPS_SCRIPT_ID_2/exec"
 
 # Global cache for dashboard data
 CACHED_DASH_DATA = {}
@@ -124,7 +124,16 @@ class GoogleCSVClient:
             response = urllib.request.urlopen(DAB_CSV_URL, timeout=10)
             data = response.read().decode('utf-8')
             
-            f = io.StringIO(data)
+            # The DAB sheet has banner rows (title + VR-group) above the real
+            # header row. Locate the header row containing 'SHOT ID' so the
+            # fetch survives minor layout changes in the live sheet.
+            lines = data.splitlines()
+            header_idx = 0
+            for i, line in enumerate(lines[:6]):
+                if 'shot id' in line.lower():
+                    header_idx = i
+                    break
+            f = io.StringIO('\n'.join(lines[header_idx:]))
             reader = csv.DictReader(f)
             
             new_data = {}
@@ -142,24 +151,86 @@ class GoogleCSVClient:
             logger.error(f"Failed to fetch dashboard: {e}")
             return False
 
+# DAB phase hierarchy — mirrors render_data_sync.js (DAB_PHASE_ORDER) and
+# production_workflow.js (getDabMasterStatuses).
+DAB_PHASE_ORDER = ['BLK', 'FCM', 'ANI', 'STD', 'VFX', 'LGT']
+DAB_TAG_TO_PHASE = {
+    'BLK': 'blocking', 'FCM': 'fincam', 'ANI': 'animation',
+    'STD': 'setdress', 'VFX': 'vfx', 'LGT': 'lighting',
+}
+# MASTER STATUS = ';'-joined [BLK, FCM, VR1, ANI, VR2, STD, VFX, LGT, VR3];
+# VR1/VR2/VR3 are stage statuses and are skipped.
+_MASTER_STATUS_PHASE_INDEX = {
+    'BLK': 0, 'FCM': 1, 'ANI': 3, 'STD': 5, 'VFX': 6, 'LGT': 7,
+}
+_INACTIVE_STATUSES = ('done', 'skip', 'not ready', 'pending parent', 'pending phase')
+
+# The six togglable production phases, ordered by pipeline chronology
+# (VR1 -> VR2 -> VR3). Shared by the publish-type enum and the UI grid.
+PHASE_ITEMS = [
+    ('blocking', 'Blocking', 'Ani: Animation Blocking phase'),
+    ('fincam', 'FinCam', 'Ani: Final Camera phase'),
+    ('animation', 'Animation', 'Ani: Animation phase'),
+    ('setdress', 'Setdress', 'Art: Setdress phase'),
+    ('vfx', 'VFX', 'Art: VFX phase'),
+    ('lighting', 'Lighting', 'Art: Lighting phase'),
+]
+
+
+def _normalize_shot_key(shot_id):
+    """Match shots by sc/sh numbers: production filenames use 'SC11-SH080'
+    while DAB SHOT IDs are 'sc11-telescope-sh080'."""
+    if not shot_id:
+        return None
+    m = re.search(r'sc0*(\d+).*?sh0*(\d+)', shot_id, re.IGNORECASE)
+    if not m:
+        return None
+    return 'sc' + str(int(m.group(1))).zfill(2), 'sh' + str(int(m.group(2))).zfill(3)
+
+
+def _is_phase_in_progress(status):
+    s = (status or '').strip().lower()
+    if not s or s in _INACTIVE_STATUSES or s.startswith('not in'):
+        return False
+    return True
+
+
 def get_active_phase_for_shot(shot_id):
     """
-    Scans the phase columns for a shot and returns the first active phase.
-    Order: BLOCKING, FINCAM, ANIMATION, SETDRESS, VFX, LIGHTING
+    Returns the chronologically highest phase currently in progress for a shot,
+    derived from the DAB MASTER STATUS column. Mirrors the sheets-side phase
+    hierarchy (production_workflow.js / render_data_sync.js). Returns a
+    lowercase phase word (blocking/fincam/animation/setdress/vfx/lighting)
+    or None.
     """
-    if not CACHED_DASH_DATA or shot_id not in CACHED_DASH_DATA:
+    if not CACHED_DASH_DATA:
         return None
-    
-    row = CACHED_DASH_DATA[shot_id]
-    phases = ['BLOCKING', 'FINCAM', 'ANIMATION', 'SETDRESS', 'VFX', 'LIGHTING']
-    
-    for phase in phases:
-        status = row.get(phase, '').strip().lower()
-        # Active means it has a status that is not 'done', 'skip', 'not ready', or empty
-        if status and status not in ('done', 'skip', 'not ready', 'nenalezeno v blk'):
-            return phase.lower()
-            
-    return None
+    target = _normalize_shot_key(shot_id)
+    if target is None:
+        return None
+    row = None
+    for dab_shot_id, dab_row in CACHED_DASH_DATA.items():
+        if _normalize_shot_key(dab_shot_id) == target:
+            row = dab_row
+            break
+    if row is None:
+        return None
+    master_status = (row.get('MASTER STATUS') or '').strip()
+    if not master_status:
+        return None
+    parts = [p.strip() for p in master_status.split(';')]
+    highest_tag = None
+    highest_rank = -1
+    for tag, idx in _MASTER_STATUS_PHASE_INDEX.items():
+        if idx >= len(parts) or not _is_phase_in_progress(parts[idx]):
+            continue
+        rank = DAB_PHASE_ORDER.index(tag)
+        if rank > highest_rank:
+            highest_rank = rank
+            highest_tag = tag
+    if highest_tag is None:
+        return None
+    return DAB_TAG_TO_PHASE[highest_tag].lower()
 
 @persistent
 def auto_switch_phase_on_load(dummy):
@@ -176,8 +247,11 @@ def auto_switch_phase_on_load(dummy):
         if active_phase:
             # We need a context to set the property, but scene is available
             for scene in bpy.data.scenes:
-                scene.krutart_publish_type = active_phase
-                logger.info(f"Auto-switched {asset_name} to phase: {active_phase}")
+                try:
+                    scene.krutart_publish_type = active_phase
+                    logger.info(f"Auto-switched {asset_name} to phase: {active_phase}")
+                except Exception as e:
+                    logger.warning(f"Could not auto-switch phase to '{active_phase}': {e}")
 
 # --- Publisher Sheets Logging ---
 
@@ -251,40 +325,11 @@ def upload_publisher_data(context, filepath, comment):
 
 def get_publish_type_items(self, context):
     """
-    Callback for Scene.krutart_publish_type EnumProperty.
-    Detects the work line (ANI or ART) from the file path and returns appropriate phases.
-    Includes any auto-detected active phase from the dashboard.
+    Returns all six production phases for the publish toggle, ordered by the
+    pipeline chronology (VR1 -> VR2 -> VR3). Mirrors the sheets-side phase
+    hierarchy (render_data_sync.js / production_workflow.js).
     """
-    filepath = bpy.data.filepath.lower()
-    items = []
-    
-    # Detect Workflow from path
-    if "-art-" in filepath or "art-work" in filepath:
-        items = [
-            ('setdress', 'Setdress', 'Art: Setdress phase'),
-            ('lighting', 'Lighting', 'Art: Lighting phase'),
-            ('vfx', 'VFX', 'Art: VFX phase'),
-            ('animation', 'Animation', 'Ani: Animation phase'),
-        ]
-    else:
-        # Default to ANI
-        items = [
-            ('blocking', 'Blocking', 'Ani: Animation Blocking phase'),
-            ('fincam', 'FinCam', 'Ani: Final Camera phase'),
-        ]
-
-    # --- NEW LOGIC: Dynamic Injection from Dashboard ---
-    _, asset_name, _, _ = parse_filename(filepath)
-    if asset_name:
-        active_phase = get_active_phase_for_shot(asset_name)
-        if active_phase:
-            # Ensure the active phase is in the items list
-            existing_ids = [it[0] for it in items]
-            if active_phase not in existing_ids:
-                items.insert(0, (active_phase, active_phase.capitalize(), f"Auto-detected phase from Dashboard: {active_phase}"))
-    # --- END NEW LOGIC ---
-
-    return items
+    return PHASE_ITEMS
 
 def parse_filename(filepath):
     """
@@ -357,6 +402,26 @@ def parse_filename(filepath):
     
     logger.debug(f"Parsed filename: project='{project_name}', asset='{asset_name}', flags='{flags}', version='{version_str}'")
     return project_name, asset_name, flags, version_int
+def get_latest_version_in_dir(directory, project, asset, flags):
+    """
+    Scans the directory for files matching the project, asset, and flags,
+    and returns the highest version number found.
+    """
+    latest_version = 0
+    if not directory or not os.path.exists(directory):
+        return latest_version
+        
+    try:
+        for filename in os.listdir(directory):
+            if not filename.lower().endswith('.blend'):
+                continue
+            p, a, f, v = parse_filename(filename)
+            if p == project and a == asset and f == flags:
+                if v is not None and v > latest_version:
+                    latest_version = v
+    except Exception as e:
+        logger.warning(f"Error scanning directory for latest version: {e}")
+    return latest_version
 
 def _is_production(filepath):
     """Detects if we are currently operating on a PRODUCTION file."""
@@ -388,8 +453,9 @@ class KRUTART_OT_save_increment(bpy.types.Operator):
             logger.error("Save Increment failed: Could not parse filename.")
             return {'CANCELLED'}
 
-        # Increment version
-        new_version = version + 1
+        # Increment version using latest version in directory
+        latest_ver = get_latest_version_in_dir(directory, project, asset, flags)
+        new_version = max(version, latest_ver) + 1
         new_version_str = f"v{new_version:03d}"
         
         # --- NEW LOGIC (v1.8.0): Dynamic publish type for PRODUCTION ---
@@ -397,7 +463,7 @@ class KRUTART_OT_save_increment(bpy.types.Operator):
             new_version_str += f"-{context.scene.krutart_publish_type}"
         # --- END NEW LOGIC ---
 
-        logger.info(f"Incrementing version from v{version:03d} to {new_version_str}")
+        logger.info(f"Incrementing version from v{version:03d} (latest in dir: v{latest_ver:03d}) to {new_version_str}")
 
         # Get comment
         comment = context.scene.krutart_comment.strip()
@@ -682,7 +748,9 @@ class KRUTART_OT_make_hero(bpy.types.Operator):
         try:
             logger.info("Step 4/4: Performing final incremental save...")
             
-            new_version = version + 1
+            work_dir = os.path.dirname(saved_work_filepath)
+            latest_ver = get_latest_version_in_dir(work_dir, project, asset, flags)
+            new_version = max(version, latest_ver) + 1
             new_version_str = f"v{new_version:03d}"
             
             # --- NEW LOGIC (v1.8.0): Dynamic publish type for PRODUCTION ---
@@ -690,7 +758,7 @@ class KRUTART_OT_make_hero(bpy.types.Operator):
                 new_version_str += f"-{context.scene.krutart_publish_type}"
             # --- END NEW LOGIC ---
 
-            logger.info(f"Incrementing work file from v{version:03d} to {new_version_str}")
+            logger.info(f"Incrementing work file from v{version:03d} (latest in dir: v{latest_ver:03d}) to {new_version_str}")
             
             # We already have the comment from the preliminary check
             
@@ -974,9 +1042,12 @@ def draw_publisher_ui(layout, context):
         dash_row.label(text=f"DAB: {DASH_FETCH_STATUS}", icon='URL')
         dash_row.operator("krutart.refresh_dash", icon='FILE_REFRESH', text="")
         
-        row = box.row(align=True)
-        # Expanded buttons for quick switching
-        row.prop(scene, "krutart_publish_type", expand=True)
+        # Phase toggle: all six phases in a 2-column x 3-row grid.
+        phase_grid = box.column(align=True)
+        for _i in range(0, len(PHASE_ITEMS), 2):
+            phase_row = phase_grid.row(align=True)
+            for _phase_id, _phase_name, _phase_desc in PHASE_ITEMS[_i:_i + 2]:
+                phase_row.prop_enum(scene, 'krutart_publish_type', _phase_id, text=_phase_name)
     # --- END NEW LOGIC ---
     
     # Shared comment field at the top
@@ -1126,7 +1197,7 @@ def register():
     logger.addHandler(handler)
     # --- End Logger Setup ---
 
-    logger.info("Registering Krutart Publisher Addon v1.8.8")
+    logger.info("Registering Krutart Publisher Addon v1.8.9")
     for cls in classes:
         bpy.utils.register_class(cls)
     

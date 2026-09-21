@@ -1,0 +1,528 @@
+╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                                             KRUTART BLENDER ADDON SUITE                                              ║
+║                                         DEVELOPMENT CONTEXT & DOCUMENTATION                                          ║
+╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║ MODULE: asset_browser_proxy-master_filter.py                                                                         ║
+╠──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╣
+║ [ DESCRIPTION ]                                                                                                      ║
+║ BL_INFO: Adds 'proxy' and 'master' buttons that filter assets by name containing -P- / -M-                           ║
+║ No description provided.                                                                                             ║
+║                                                                                                                      ║
+║ [ CLASSES ]                                                                                                          ║
+║ • class ABQF_OT_set                                                                                                  ║
+║     Set Asset Browser search filter text                                                                             ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class FILEBROWSER_PT_abqf                                                                                          ║
+║     Methods: poll, draw                                                                                              ║
+║                                                                                                                      ║
+║ [ FUNCTIONS ]                                                                                                        ║
+║ • def _ensure_assets_mode()                                                                                          ║
+║ • def _set_search()                                                                                                  ║
+║ • def _apply_to_all_asset_browsers()                                                                                 ║
+║ • def _draw_header()                                                                                                 ║
+║ • def register()                                                                                                     ║
+║ • def unregister()                                                                                                   ║
+║                                                                                                                      ║
+╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║ MODULE: krutart-advanced_copy.py                                                                                     ║
+╠──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╣
+║ [ DESCRIPTION ]                                                                                                      ║
+║ BL_INFO: Provides specific hierarchy traversal copy/move functionalities with dynamic, high-performance, shot-base   ║
+║ No description provided.                                                                                             ║
+║                                                                                                                      ║
+║ [ CLASSES ]                                                                                                          ║
+║ • class ADVCOPY_OT_copy_to_shot                                                                                      ║
+║     Copies the datablock to a specified shot collection.                                                             ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class ADVCOPY_OT_move_to_all_shots                                                                                 ║
+║     Moves the selected item to all relevant shot collections, then removes the original.                             ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class ADVCOPY_OT_move_to_all_scenes                                                                                ║
+║     Copies an item from an ENV collection to all SCENE collections with a matching environment name, then removes    ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class ADVCOPY_OT_copy_to_all_enviros                                                                               ║
+║     Copies an item from a LOC collection into each ENV collection, creating a unique item for each, and removes th   ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class ADVCOPY_OT_clear_original_visibility                                                                         ║
+║     Resets the visibility of all original items that have been hidden by the shot system.                            ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class ADVCOPY_OT_rebuild_visibility_cache                                                                          ║
+║     Manually rebuilds the shot visibility cache for the current scene.                                               ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class ADVCOPY_MT_copy_to_shot_menu                                                                                 ║
+║     Dynamically lists available shot collections from the current scene for copying.                                 ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ • class ADVCOPY_PT_layout_suite_panel                                                                                ║
+║     Creates a Panel in the 3D Viewport 'N' menu for visibility tools.                                                ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ [ FUNCTIONS ]                                                                                                        ║
+║ • def load_copy_map()                                                                                                ║
+║     Loads the persistent copy map from the blend file's Text Blocks.                                                 ║
+║ • def save_copy_map()                                                                                                ║
+║     Saves the copy map dictionary back to the blend file's Text Blocks                                               ║
+║ • def get_shot_identifier()                                                                                          ║
+║     Extracts 'SC##-SH###' from a collection or marker name.                                                          ║
+║ • def get_all_shot_collections()                                                                                     ║
+║     Scans the blend file for all collections matching the shot naming convention.                                    ║
+║ • def _collect_all_items_recursive()                                                                                 ║
+║     Recursively collects all objects and child collections from a starting collection.                               ║
+║ • def build_visibility_data()                                                                                        ║
+║     Builds all necessary caches for high-performance visibility updates.                                             ║
+║ • def build_visibility_data_on_load()                                                                                ║
+║     Wrapper for the load_post handler.                                                                               ║
+║ • def set_item_visibility()                                                                                          ║
+║     Sets the visibility for an object or a collection within a specific view layer.                                  ║
+║ • def on_frame_change_update_visibility()                                                                            ║
+║     Handler that runs on frame change. Uses pre-built caches for high performance.                                   ║
+║ • def get_datablock_from_context()                                                                                   ║
+║     Determines the target datablock from the context, prioritizing what was right-clicked.                           ║
+║ • def copy_collection_hierarchy()                                                                                    ║
+║     Recursively performs a DEEP COPY (localization) or DUPLICATE (override)                                          ║
+║ • def get_project_scenes()                                                                                           ║
+║     Retrieves all scenes matching the 'SC##-' naming convention.                                                     ║
+║ • def is_in_build_hierarchy()                                                                                        ║
+║     Checks if a LayerCollection is part of an 'original' hierarchy,                                                  ║
+║ • def find_original_layer_collection()                                                                               ║
+║     Recursively finds the LayerCollection that uses collection_datablock                                             ║
+║ • def find_layer_collection_by_name()                                                                                ║
+║     Recursively finds the LayerCollection corresponding to a given Collection name.                                  ║
+║ • def set_collection_exclude()                                                                                       ║
+║     Safely finds a collection by name in the view layer and sets its exclude status.                                 ║
+║ • def get_source_collection()                                                                                        ║
+║     Finds the collection an object or collection belongs to.                                                         ║
+║ • def get_item_and_containing_collection()                                                                           ║
+║     Returns the item itself and its immediate parent collection.                                                     ║
+║ • def is_in_shot_build_collection()                                                                                  ║
+║     Recursively checks if an item is inside a collection whose name starts with '+SC', '+ART', etc.                  ║
+║ • def add_context_menus()                                                                                            ║
+║     Generic function to draw the menu items based on the current context.                                            ║
+║ • def update_auto_shot_exclusion()                                                                                   ║
+║     Called when the auto_shot_exclusion property is changed.                                                         ║
+║ • def register()                                                                                                     ║
+║ • def unregister()                                                                                                   ║
+║                                                                                                                      ║
+╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║ MODULE: krutart-animation_controls.py                                                                                ║
+╠──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╣
+║ [ DESCRIPTION ]                                                                                                      ║
+║ BL_INFO: Unified animation controls for Dope Sheet and Graph Editor with Marker support.                             ║
+║ No description provided.                                                                                             ║
+║                                                                                                                      ║
+║ [ CLASSES ]                                                                                                          ║
+║ • class KRUTART_OT_set_keyingset                                                                                     ║
+║     Set the active keying set safely                                                                                 ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class KRUTART_PT_timeline_base                                                                                     ║
+║     Base class for shared UI logic between Dope Sheet and Graph Editor                                               ║
+║     Methods: poll, draw                                                                                              ║
+║                                                                                                                      ║
+║ • class DOPESHEET_PT_krutart_controls                                                                                ║
+║                                                                                                                      ║
+║ • class GRAPH_PT_krutart_controls                                                                                    ║
+║                                                                                                                      ║
+║ [ FUNCTIONS ]                                                                                                        ║
+║ • def register()                                                                                                     ║
+║ • def unregister()                                                                                                   ║
+║                                                                                                                      ║
+╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║ MODULE: krutart-b_render.py                                                                                          ║
+╠──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╣
+║ [ DESCRIPTION ]                                                                                                      ║
+║ BL_INFO: Prepares render files, submits to Deadline, and logs to Google Sheets (Robust).                             ║
+║ No description provided.                                                                                             ║
+║                                                                                                                      ║
+║ [ CLASSES ]                                                                                                          ║
+║ • class BRENDER_ShotListItem                                                                                         ║
+║                                                                                                                      ║
+║ • class BRENDER_UL_shot_list                                                                                         ║
+║     Methods: draw_item                                                                                               ║
+║                                                                                                                      ║
+║ • class BRENDER_AddonPreferences                                                                                     ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ • class BRENDER_OT_select_all_shots                                                                                  ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class BRENDER_OT_prepare_this_file                                                                                 ║
+║     Methods: poll, execute                                                                                           ║
+║                                                                                                                      ║
+║ • class BRENDER_OT_refresh_shot_list                                                                                 ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class BRENDER_OT_prepare_active_shot                                                                               ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class BRENDER_OT_prepare_render_batch                                                                              ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class VIEW3D_PT_brender_panel                                                                                      ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ • class BRENDER_OT_debug_test_upload                                                                                 ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class BRENDER_OT_debug_set_shot                                                                                    ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class BRENDER_OT_debug_step_1_create_scene                                                                         ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class BRENDER_OT_debug_step_2_find_data                                                                            ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class BRENDER_OT_debug_step_3_bind_cameras                                                                         ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class BRENDER_OT_debug_step_4_add_strips                                                                           ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class BRENDER_OT_debug_step_5_set_scene_settings                                                                   ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class BRENDER_OT_debug_step_6_set_render_path                                                                      ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class BRENDER_OT_debug_step_7_move_strip                                                                           ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class BRENDER_OT_debug_step_8_set_active                                                                           ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class VIEW3D_PT_brender_debug_panel                                                                                ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ [ FUNCTIONS ]                                                                                                        ║
+║ • def get_prefs()                                                                                                    ║
+║     Helper to get addon preferences.                                                                                 ║
+║ • def _send_payload_thread()                                                                                         ║
+║     Worker function to send data to Google Sheets.                                                                   ║
+║ • def upload_shot_data()                                                                                             ║
+║     Prepares data (Filename, Version, User) and starts the upload thread.                                            ║
+║ • def _parse_name_components()                                                                                       ║
+║     Parses all required name components from the shot and scene.                                                     ║
+║ • def _get_shot_timing()                                                                                             ║
+║     Utility to get shot start, end, and duration.                                                                    ║
+║ • def _get_scene_content_duration()                                                                                  ║
+║     Finds the intended duration of the scene's content.                                                              ║
+║ • def _prepare_shot_in_current_file()                                                                                ║
+║     Prepares the 'render' scene for a given shot marker.                                                             ║
+║ • def _get_new_brender_filepath_parts()                                                                              ║
+║     Calculates the directory, version, and final path for a new bRender file.                                        ║
+║ • def get_new_brender_filepath()                                                                                     ║
+║ • def get_shot_info_from_frame()                                                                                     ║
+║ • def get_all_shots()                                                                                                ║
+║ • def _purge_orphans()                                                                                               ║
+║     Aggressively purges all orphaned data-blocks.                                                                    ║
+║ • def _submit_to_deadline()                                                                                          ║
+║     Submits a specific blend file to Deadline.                                                                       ║
+║ • def auto_refresh_shot_list()                                                                                       ║
+║     Handler that refreshes the shot list when:                                                                       ║
+║ • def register()                                                                                                     ║
+║ • def unregister()                                                                                                   ║
+║                                                                                                                      ║
+╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║ MODULE: krutart-configurator.py                                                                                      ║
+╠──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╣
+║ [ DESCRIPTION ]                                                                                                      ║
+║ BL_INFO: Enforces company standards, manages assets, logs save history, and synchronizes company addons.             ║
+║ No description provided.                                                                                             ║
+║                                                                                                                      ║
+║ [ CLASSES ]                                                                                                          ║
+║ • class KRUTART_OT_sync_addons                                                                                       ║
+║     Checks the company folder and updates other addons                                                               ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class KRUTART_OT_update_configurator                                                                               ║
+║     Updates the Krutart Configurator addon itself                                                                    ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class KRUTART_OT_refresh_identity                                                                                  ║
+║     Reloads the workstation identifier map from the server                                                           ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class KRUTART_OT_register_identity                                                                                 ║
+║     Registers the current workstation to the text file                                                               ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class KrutartConfiguratorPreferences                                                                               ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ [ FUNCTIONS ]                                                                                                        ║
+║ • def is_company_file()                                                                                              ║
+║     Returns True if the current file is saved within company directories.                                            ║
+║ • def get_bl_info_from_file()                                                                                        ║
+║     Safely reads an addon's .py file and extracts its bl_info dictionary                                             ║
+║ • def load_identity_map()                                                                                            ║
+║     Parses the text file at WORKSTATION_ID_FILE.                                                                     ║
+║ • def append_identity_to_file()                                                                                      ║
+║     Appends a new mapping to the external file.                                                                      ║
+║ • def sync_company_addons()                                                                                          ║
+║     Scans COMPANY_ADDON_PATH and installs/updates .py addons.                                                        ║
+║ • def perform_self_update()                                                                                          ║
+║     Updates THIS addon file using the Rename-then-Copy method                                                        ║
+║ • def update_internal_save_log()                                                                                     ║
+║     Updates the internal krutart-configurations.info text block                                                      ║
+║ • def on_save_pre()                                                                                                  ║
+║     Enforces pipeline standards before saving.                                                                       ║
+║ • def on_load_post()                                                                                                 ║
+║     Runs on file open.                                                                                               ║
+║ • def add_bookmarks()                                                                                                ║
+║ • def configure_asset_libraries()                                                                                    ║
+║ • def configure_startup_settings()                                                                                   ║
+║ • def run_startup_logic()                                                                                            ║
+║ • def register()                                                                                                     ║
+║ • def unregister()                                                                                                   ║
+║                                                                                                                      ║
+╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║ MODULE: krutart-empty_resizer.py                                                                                     ║
+╠──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╣
+║ [ DESCRIPTION ]                                                                                                      ║
+║ BL_INFO: Finds all empties in the scene and sets their display size.                                                 ║
+║ No description provided.                                                                                             ║
+║                                                                                                                      ║
+║ [ CLASSES ]                                                                                                          ║
+║ • class OBJECT_OT_resize_all_empties_small                                                                           ║
+║     Operator to find all empties and set their display size to 0.01m                                                 ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class OBJECT_OT_resize_all_empties_large                                                                           ║
+║     Operator to find all empties and set their display size to 1.0m                                                  ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class VIEW3D_PT_resize_empties_panel                                                                               ║
+║     Creates a Panel in the 3D Viewport's UI sidebar                                                                  ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ [ FUNCTIONS ]                                                                                                        ║
+║ • def register()                                                                                                     ║
+║     This function is called when the addon is enabled.                                                               ║
+║ • def unregister()                                                                                                   ║
+║     This function is called when the addon is disabled.                                                              ║
+║                                                                                                                      ║
+╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║ MODULE: krutart-layout-suite.py                                                                                      ║
+╠──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╣
+║ [ DESCRIPTION ]                                                                                                      ║
+║ BL_INFO: A unified addon for scene setup, animatic import, and a persistent camera switcher based on timeline mark   ║
+║ No description provided.                                                                                             ║
+║                                                                                                                      ║
+║ [ CLASSES ]                                                                                                          ║
+║ • class LayoutCameraAddonPreferences                                                                                 ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ • class SCENE_OT_create_location_structure                                                                           ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class SCENE_OT_create_enviro_structure                                                                             ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class SCENE_OT_create_scene_structure                                                                              ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class SCENE_OT_verify_shot_collections                                                                             ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class SEQUENCER_OT_import_single_guide                                                                             ║
+║     Methods: execute, invoke                                                                                         ║
+║                                                                                                                      ║
+║ • class SEQUENCER_OT_import_animatic_guides                                                                          ║
+║     Robustly imports all guide clips from the selected file's directory.                                             ║
+║     Methods: execute, invoke                                                                                         ║
+║                                                                                                                      ║
+║ • class SCENE_OT_setup_cameras_from_markers                                                                          ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class VIEW3D_PT_layout_suite_main_panel                                                                            ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ [ FUNCTIONS ]                                                                                                        ║
+║ • def find_view_collections_by_substring_in_collection()                                                             ║
+║ • def hide_collections_in_view_layer()                                                                               ║
+║ • def get_or_create_collection()                                                                                     ║
+║ • def parse_shot_filename()                                                                                          ║
+║     Parses a filename to extract SC and SH numbers.                                                                  ║
+║ • def create_marker_from_strip()                                                                                     ║
+║     Creates or updates a marker based on the strip's filename at the strip's start frame.                            ║
+║ • def apply_shot_camera_state()                                                                                      ║
+║     Core logic to apply camera settings.                                                                             ║
+║ • def update_all_shot_cameras()                                                                                      ║
+║     Callback for the UI Property.                                                                                    ║
+║ • def on_frame_change()                                                                                              ║
+║ • def draw_camera_toggle()                                                                                           ║
+║ • def on_file_loaded()                                                                                               ║
+║     Handler for file load.                                                                                           ║
+║ • def register()                                                                                                     ║
+║ • def unregister()                                                                                                   ║
+║                                                                                                                      ║
+╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║ MODULE: krutart-os_path_bridge.py                                                                                    ║
+╠──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╣
+║ [ DESCRIPTION ]                                                                                                      ║
+║ BL_INFO: Fixed syntax error. Force-fixes /s/ paths for Ghost Files.                                                  ║
+║ No description provided.                                                                                             ║
+║                                                                                                                      ║
+║ [ CLASSES ]                                                                                                          ║
+║ • class KRUTART_OT_FixPathsMac                                                                                       ║
+║     Force fix broken paths (Ignores 'File Not Found' checks)                                                         ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class KRUTART_OT_Diagnose                                                                                          ║
+║     Print path analysis to Console                                                                                   ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class KrutartPathPreferences                                                                                       ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ • class KRUTART_PT_Panel                                                                                             ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ [ FUNCTIONS ]                                                                                                        ║
+║ • def get_prefs()                                                                                                    ║
+║ • def get_mac_root()                                                                                                 ║
+║     Finds the local folder ending in '3212-PREPRODUCTION'.                                                           ║
+║ • def get_win_config()                                                                                               ║
+║ • def to_win_absolute()                                                                                              ║
+║     Local Mac -> S:Ñ2-PREPRODUCTION\...                                                                              ║
+║ • def to_mac_absolute()                                                                                              ║
+║     Repairs paths by anchoring to the PROJECT_NAME.                                                                  ║
+║ • def iter_external_data()                                                                                           ║
+║ • def run_bridge_to_mac()                                                                                            ║
+║ • def run_bridge_to_windows()                                                                                        ║
+║ • def on_save_pre()                                                                                                  ║
+║ • def on_save_post()                                                                                                 ║
+║ • def on_load_post()                                                                                                 ║
+║ • def delayed_load_fix()                                                                                             ║
+║ • def register()                                                                                                     ║
+║ • def unregister()                                                                                                   ║
+║                                                                                                                      ║
+╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║ MODULE: krutart-proxy_master_switcher.py                                                                             ║
+╠──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╣
+║ [ DESCRIPTION ]                                                                                                      ║
+║ BL_INFO: Seamlessly swap between -p (proxy) and -m (master) asset versions preserving hierarchy.                     ║
+║ No description provided.                                                                                             ║
+║                                                                                                                      ║
+║ [ CLASSES ]                                                                                                          ║
+║ • class SwappableAsset                                                                                               ║
+║     Stores the name of a *wrapper object* in the scene                                                               ║
+║                                                                                                                      ║
+║ • class AddonPreferences                                                                                             ║
+║                                                                                                                      ║
+║ • class MY_OT_refresh_assets                                                                                         ║
+║     Asset Discovery Operator.                                                                                        ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class MY_OT_swap_asset_version                                                                                     ║
+║     Swaps an asset to its tandem version.                                                                            ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class MY_PT_asset_switcher_panel                                                                                   ║
+║     The N-Panel UI for the addon.                                                                                    ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ [ FUNCTIONS ]                                                                                                        ║
+║ • def get_addon_prefs()                                                                                              ║
+║     Helper function to get the addon preferences                                                                     ║
+║ • def debug_log()                                                                                                    ║
+║     Custom logging function that prints to the console only if                                                       ║
+║ • def get_base_data_block()                                                                                          ║
+║     Helper function to "dig" into a wrapper object and find the                                                      ║
+║ • def get_asset_details_from_name()                                                                                  ║
+║     Helper function to parse a name and build the details dictionary.                                                ║
+║ • def get_asset_details_case_1()                                                                                     ║
+║     Performs ONLY a Case 1 check.                                                                                    ║
+║ • def get_asset_details_case_2()                                                                                     ║
+║     Performs ONLY a Case 2 check.                                                                                    ║
+║ • def get_asset_details()                                                                                            ║
+║     Analyzes a swappable object and returns a dictionary                                                             ║
+║ • def outliner_context_menu_func()                                                                                   ║
+║     Appends the 'Swap Asset' button to the Outliner context menu.                                                    ║
+║ • def register()                                                                                                     ║
+║ • def unregister()                                                                                                   ║
+║                                                                                                                      ║
+╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║ MODULE: krutart-publisher.py                                                                                         ║
+╠──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╣
+║ [ DESCRIPTION ]                                                                                                      ║
+║ BL_INFO: Streamlines incremental saving and hero file creation with detailed logging. Syncs identity with Configur   ║
+║ No description provided.                                                                                             ║
+║                                                                                                                      ║
+║ [ CLASSES ]                                                                                                          ║
+║ • class KRUTART_OT_save_increment                                                                                    ║
+║     Saves the file with an incremented version number and opens the new file                                         ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class KRUTART_OT_make_hero                                                                                         ║
+║     Saves the current file, creates a 'hero' copy, then saves an incremented version of the work file.               ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class KRUTART_PT_autopublisher_panel                                                                               ║
+║     Creates a Panel in the Output Properties window                                                                  ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ • class KRUTART_PT_autopublisher_dopesheet                                                                           ║
+║     Creates a Panel in the Dope Sheet Sidebar                                                                        ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ [ FUNCTIONS ]                                                                                                        ║
+║ • def get_current_filepath()                                                                                         ║
+║     Returns the absolute path of the current Blender file.                                                           ║
+║ • def get_current_user()                                                                                             ║
+║     Determines the current user.                                                                                     ║
+║ • def parse_filename()                                                                                               ║
+║     Parses the filename to extract project name, asset name, flags, and version.                                     ║
+║ • def draw_publisher_ui()                                                                                            ║
+║     Shared function to draw the publisher UI in multiple panels.                                                     ║
+║ • def register()                                                                                                     ║
+║ • def unregister()                                                                                                   ║
+║                                                                                                                      ║
+╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║ MODULE: krutart-render_settings.py                                                                                   ║
+╠──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╣
+║ [ DESCRIPTION ]                                                                                                      ║
+║ BL_INFO: Fetch render settings from Public Google Sheets.                                                            ║
+║ No description provided.                                                                                             ║
+║                                                                                                                      ║
+║ [ CLASSES ]                                                                                                          ║
+║ • class GoogleCSVClient                                                                                              ║
+║     Methods: __init__, fetch_all_settings                                                                            ║
+║                                                                                                                      ║
+║ • class KRUTART_AddonPreferences                                                                                     ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ • class KA_OT_fetch_settings                                                                                         ║
+║     Fetch Settings from Public Google Sheets (Modal)                                                                 ║
+║     Methods: execute, modal                                                                                          ║
+║                                                                                                                      ║
+║ • class KA_OT_apply_config                                                                                           ║
+║     Apply a Google Sheet Configuration (Default, Animation, Art)                                                     ║
+║     Methods: execute                                                                                                 ║
+║                                                                                                                      ║
+║ • class KA_PT_render_settings                                                                                        ║
+║     Methods: draw                                                                                                    ║
+║                                                                                                                      ║
+║ [ FUNCTIONS ]                                                                                                        ║
+║ • def parse_project_name()                                                                                           ║
+║     Parses Project Name from filename using convention: Project-Scene-Shot-Version.blend                             ║
+║ • def get_rna_property_type()                                                                                        ║
+║     Inspects the RNA of a Blender object to find the expected type of a property.                                    ║
+║ • def robust_cast()                                                                                                  ║
+║     Casts string from Google Sheet to correct Blender type.                                                          ║
+║ • def apply_settings_from_rows()                                                                                     ║
+║     Iterates through rows and applies settings.                                                                      ║
+║ • def register()                                                                                                     ║
+║ • def unregister()                                                                                                   ║
+║                                                                                                                      ║
+╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║                                                                                                                      ║
+╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝

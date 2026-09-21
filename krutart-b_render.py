@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Krutart bRender + Deadline + Sheets",
     "author": "iori, Krutart, Gemini",
-    "version": (5, 0, 5),
+    "version": (5, 1, 6),
     "blender": (4, 5, 0),
     "location": "3D View > Sidebar > bRender",
     "description": "Prepares render files, submits to Deadline, and logs to Google Sheets.",
@@ -17,6 +17,8 @@ import logging
 import sys
 import subprocess
 import tempfile
+import csv
+import io
 import json
 import urllib.request
 import threading
@@ -47,23 +49,31 @@ def attach_project_logger(target_directory):
     """
     Dynamically attaches a FileHandler to route logs to the specific render directory.
     Removes any previously attached FileHandlers to prevent cross-logging in batches.
+    Safely closes stream handles and handles file locks/permission errors gracefully.
     """
     for handler in log.handlers[:]:
         if isinstance(handler, logging.FileHandler):
+            try:
+                handler.close()
+            except Exception:
+                pass
             log.removeHandler(handler)
 
     if not target_directory:
         return
 
-    os.makedirs(target_directory, exist_ok=True)
-    log_file_path = os.path.join(target_directory, "brender_deadline_submit.log")
-    
-    file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
-    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(file_formatter)
-    log.addHandler(file_handler)
-    
-    log.info(f"=== bRender Log Initialized in: {target_directory} ===")
+    try:
+        os.makedirs(target_directory, exist_ok=True)
+        log_file_path = os.path.join(target_directory, "brender_deadline_submit.log")
+        
+        file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
+        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
+        log.addHandler(file_handler)
+        
+        log.info(f"=== bRender Log Initialized in: {target_directory} ===")
+    except (PermissionError, OSError) as e:
+        log.warning(f"Could not initialize file logger in '{target_directory}': {e}. Continuing with standard logging.")
 
 # --- GLOBAL VARS FOR HANDLERS ---
 _last_scene_name = ""
@@ -144,10 +154,11 @@ def _send_payload_thread(urls, payload):
                 req = urllib.request.Request(url, data=data, headers=headers, method='POST')
                 log.info(f"Uploading to Sheets: {url} (Attempt {attempt}/{max_retries})...")
                 
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    result = response.read().decode('utf-8')
-                    log.info(f"Google Sheet Response: {result}")
-                    break # Success! Move to next URL.
+                with BrenderTimer(f"Sheets Upload Request (Attempt {attempt})"):
+                    with urllib.request.urlopen(req, timeout=10) as response:
+                        result = response.read().decode('utf-8')
+                        log.info(f"Google Sheet Response: {result}")
+                break # Success! Move to next URL.
                     
             except Exception as e:
                 log.error(f"Error during Sheets upload to {url}: {e}")
@@ -157,14 +168,14 @@ def _send_payload_thread(urls, payload):
 
 def upload_shot_data(context, shot_name, filename, version_str):
     """
-    Prepares data (Filename, Version, User) and starts the upload thread for both projects.
+    Prepares data (Filename, Version, User) and starts separate parallel upload threads for each URL.
     """
     prefs = get_prefs(context)
     if not prefs:
         return
 
     url_preprod = prefs.google_webapp_url.strip() if prefs.google_webapp_url else ""
-    url_prod = "https://script.google.com/macros/s/AKfycbwnRq0OGESnMN3BB41q5ldfL71q2FLBiXPcHbdkDR5hO-NeBqrTZoxPCWgKukjeleSE9Q/exec"
+    url_prod = "https://script.google.com/macros/s/KRUTART_REDACTED_APPS_SCRIPT_ID_1/exec"
     
     urls = [u for u in [url_preprod, url_prod] if u and u.startswith("http")]
     
@@ -181,9 +192,45 @@ def upload_shot_data(context, shot_name, filename, version_str):
         "user": user_name
     }
 
-    t = threading.Thread(target=_send_payload_thread, args=(urls, payload))
-    t.start()
+    for url in urls:
+        t = threading.Thread(target=_send_payload_thread, args=([url], payload))
+        t.start()
 
+
+
+# --- PERFORMANCE TIMER ---
+class BrenderTimer:
+    """
+    A utility class to measure and log execution times of code blocks.
+    Can be used as a context manager:
+        with BrenderTimer("Destructive Save"):
+            ...
+    Or manually:
+        timer = BrenderTimer("Whole Submission")
+        timer.start()
+        ...
+        timer.stop()
+    """
+    def __init__(self, name):
+        self.name = name
+        self.start_time = None
+        self.elapsed = 0.0
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+
+    def start(self):
+        self.start_time = time.perf_counter()
+        log.info(f"[Perf] START: {self.name}")
+
+    def stop(self):
+        if self.start_time is not None:
+            self.elapsed = time.perf_counter() - self.start_time
+            log.info(f"[Perf] END: {self.name} | Duration: {self.elapsed:.4f}s")
 
 # --- UTILITY FUNCTIONS ---
 def set_active_scene_safe(context, target_scene):
@@ -224,41 +271,42 @@ def get_production_scene_dir_b_render(context, sc, sh):
     3212-PRODUCTION directly for the full SC folder (e.g. SC17-DARKPOINT)
     and returns to the specific SH folder.
     """
-    os_bridge = get_os_bridge(context)
-    if not os_bridge:
-        log.warning("[bRender] get_production_scene_dir: os_bridge not found.")
-        return None
+    with BrenderTimer("Resolve Production SC Directory"):
+        os_bridge = get_os_bridge(context)
+        if not os_bridge:
+            log.warning("[bRender] get_production_scene_dir: os_bridge not found.")
+            return None
 
-    mac_root = os_bridge.get_mac_root(context)
-    if not mac_root:
-        log.warning("[bRender] get_production_scene_dir: mac_root could not be resolved.")
-        return None
-        
-    shared_drives = mac_root.parent
-    production_root = shared_drives / "3212-PRODUCTION"
-    
-    if not production_root.exists():
-        log.warning(f"[bRender] get_production_scene_dir: PRODUCTION root missing at {production_root}")
-        return None
-        
-    sc_upper = sc.upper()
-    sh_upper = sh.upper()
-    search_prefix = f"{sc_upper}-"
-    
-    sc_dir_name = None
-    for d in production_root.iterdir():
-        if d.is_dir() and d.name.upper().startswith(search_prefix):
-            sc_dir_name = d.name
-            break
+        mac_root = os_bridge.get_mac_root(context)
+        if not mac_root:
+            log.warning("[bRender] get_production_scene_dir: mac_root could not be resolved.")
+            return None
             
-    if not sc_dir_name:
-        log.warning(f"[bRender] get_production_scene_dir: Could not find SC folder starting with {search_prefix} in {production_root}")
-        return None
+        shared_drives = mac_root.parent
+        production_root = shared_drives / "3212-PRODUCTION"
         
-    sh_target = f"{sc_upper}-{sh_upper}"
-    sh_dir = production_root / sc_dir_name / sh_target
-    
-    return str(sh_dir)
+        if not production_root.exists():
+            log.warning(f"[bRender] get_production_scene_dir: PRODUCTION root missing at {production_root}")
+            return None
+            
+        sc_upper = sc.upper()
+        sh_upper = sh.upper()
+        search_prefix = f"{sc_upper}-"
+        
+        sc_dir_name = None
+        for d in production_root.iterdir():
+            if d.is_dir() and d.name.upper().startswith(search_prefix):
+                sc_dir_name = d.name
+                break
+                
+        if not sc_dir_name:
+            log.warning(f"[bRender] get_production_scene_dir: Could not find SC folder starting with {search_prefix} in {production_root}")
+            return None
+            
+        sh_target = f"{sc_upper}-{sh_upper}"
+        sh_dir = production_root / sc_dir_name / sh_target
+        
+        return str(sh_dir)
 
 def _get_composite_production_version(context):
     """
@@ -305,73 +353,75 @@ def _find_film_scene_name_on_disk(base_path, scene_number_str):
     Scans the OUTPUT_BASE directory for a folder matching SC{number}-NAME.
     Returns the 'NAME' part (Film Scene Name) if found, otherwise None.
     """
-    if not os.path.exists(base_path):
+    with BrenderTimer(f"Disk Scan: Find Scene {scene_number_str} on disk"):
+        if not os.path.exists(base_path):
+            return None
+
+        search_prefix = scene_number_str.upper()
+
+        try:
+            for d in os.listdir(base_path):
+                if not os.path.isdir(os.path.join(base_path, d)):
+                    continue
+
+                d_upper = d.upper()
+                if d_upper.startswith(f"{search_prefix}-"):
+                    parts = d.split("-", 1)
+                    if len(parts) > 1:
+                        return parts[1]
+
+        except Exception as e:
+            log.error(f"Error scanning directory for film scene name: {e}")
+
         return None
-
-    search_prefix = scene_number_str.upper()
-
-    try:
-        for d in os.listdir(base_path):
-            if not os.path.isdir(os.path.join(base_path, d)):
-                continue
-
-            d_upper = d.upper()
-            if d_upper.startswith(f"{search_prefix}-"):
-                parts = d.split("-", 1)
-                if len(parts) > 1:
-                    return parts[1]
-
-    except Exception as e:
-        log.error(f"Error scanning directory for film scene name: {e}")
-
-    return None
 
 def _parse_name_components(context, shot_marker_name, source_scene_name):
     """Parses all required name components."""
-    log.info("Parsing name components...")
+    with BrenderTimer(f"Parse Name Components for {shot_marker_name}"):
+        log.info("Parsing name components...")
 
-    shot_match = re.match(r"CAM-(SC\d+)-(SH\d+)", shot_marker_name, re.IGNORECASE)
-    if not shot_match:
-        log.error(f"Could not parse shot marker name: {shot_marker_name}")
-        return None
+        shot_match = re.match(r"CAM-(SC\d+)-(SH\d+)", shot_marker_name, re.IGNORECASE)
+        if not shot_match:
+            log.error(f"Could not parse shot marker name: {shot_marker_name}")
+            return None
 
-    scene_number = shot_match.group(1).upper()
-    shot_number = shot_match.group(2).upper()
+        scene_number = shot_match.group(1).upper()
+        shot_number = shot_match.group(2).upper()
 
-    prefs = get_prefs(context)
-    if not prefs:
-        log.error("Could not access Addon Preferences.")
-        return None
+        prefs = get_prefs(context)
+        if not prefs:
+            log.error("Could not access Addon Preferences.")
+            return None
 
-    base_path = bpy.path.abspath(prefs.output_base)
-    film_scene_name = _find_film_scene_name_on_disk(base_path, scene_number)
+        base_path = bpy.path.abspath(prefs.output_base)
+        film_scene_name = _find_film_scene_name_on_disk(base_path, scene_number)
 
-    if film_scene_name:
-        log.info(f"Found Film Scene Name on disk: {film_scene_name}")
-        env_name = film_scene_name
-    else:
-        log.warning(f"Could not find folder for {scene_number} in {base_path}. Falling back to Blender Scene Name.")
-        env_match = re.search(r"sc\d+[-_](.+)", source_scene_name, re.IGNORECASE)
-        env_name = env_match.group(1) if env_match else "env"
+        if film_scene_name:
+            log.info(f"Found Film Scene Name on disk: {film_scene_name}")
+            env_name = film_scene_name
+        else:
+            log.warning(f"Could not find folder for {scene_number} in {base_path}. Falling back to Blender Scene Name.")
+            env_match = re.search(r"sc\d+[-_](.+)", source_scene_name, re.IGNORECASE)
+            env_name = env_match.group(1) if env_match else "env"
 
-    project_code = prefs.project_code
-    
-    if _is_production(context):
-        render_phase = getattr(context.scene, "brender_render_phase", "blocking")
-        task = f"{render_phase}_r"
-    else:
-        task = "layout_r"
+        project_code = prefs.project_code
+        
+        if _is_production(context):
+            render_phase = getattr(context.scene, "brender_render_phase", "blocking")
+            task = f"{render_phase}_r"
+        else:
+            task = "layout_r"
 
-    components = {
-        "project_code": project_code,
-        "scene_number": scene_number,
-        "shot_number": shot_number,
-        "env_name": env_name,
-        "task": task,
-        "shot_marker_name": shot_marker_name
-    }
-    log.info(f"Parsed components: {components}")
-    return components
+        components = {
+            "project_code": project_code,
+            "scene_number": scene_number,
+            "shot_number": shot_number,
+            "env_name": env_name,
+            "task": task,
+            "shot_marker_name": shot_marker_name
+        }
+        log.info(f"Parsed components: {components}")
+        return components
 
 def _get_shot_timing(context, shot_marker):
     """Utility to get shot start, end, and duration."""
@@ -429,38 +479,41 @@ def _perform_destructive_save(context, new_filepath, source_scene_name, output_f
     Helper function to safely strip out all unneeded scenes, purge orphans,
     save the file, and seamlessly restore the user's Blender session using Undo.
     """
-    log.info("Performing destructive scene cleanup for batch save...")
-    
-    can_undo = True
-    try:
-        bpy.ops.ed.undo_push(message="Pre-Cleanup State")
-    except Exception as e:
-        log.warning(f"Undo push failed: {e}. Scene cleanup bypassed to protect master file.")
-        can_undo = False
+    with BrenderTimer(f"Destructive Save & Clean: {os.path.basename(new_filepath)}"):
+        log.info("Performing destructive scene cleanup for batch save...")
         
-    if can_undo:
-        scenes_to_keep = [source_scene_name]
-        if output_format == 'VIDEO':
-            scenes_to_keep.append("render")
-            
-        for scn in list(bpy.data.scenes):
-            if scn.name not in scenes_to_keep:
-                try:
-                    bpy.data.scenes.remove(scn)
-                except Exception as e:
-                    log.warning(f"Could not remove scene '{scn.name}': {e}")
-        
-        _purge_orphans()
-        
-    bpy.ops.wm.save_as_mainfile(filepath=new_filepath, copy=True)
-    log.info(f"Saved optimized copy: {os.path.basename(new_filepath)}")
-    
-    if can_undo:
+        can_undo = True
         try:
-            bpy.ops.ed.undo()
-            log.info("Master file state restored successfully.")
+            bpy.ops.ed.undo_push(message="Pre-Cleanup State")
         except Exception as e:
-            log.error(f"Failed to restore scenes after save: {e}")
+            log.warning(f"Undo push failed: {e}. Scene cleanup bypassed to protect master file.")
+            can_undo = False
+            
+        if can_undo:
+            scenes_to_keep = [source_scene_name]
+            if output_format == 'VIDEO':
+                scenes_to_keep.append("render")
+                
+            for scn in list(bpy.data.scenes):
+                if scn.name not in scenes_to_keep:
+                    try:
+                        bpy.data.scenes.remove(scn)
+                    except Exception as e:
+                        log.warning(f"Could not remove scene '{scn.name}': {e}")
+            
+            _purge_orphans()
+            
+        with BrenderTimer("Save Mainfile Ops"):
+            bpy.ops.wm.save_as_mainfile(filepath=new_filepath, copy=True)
+        log.info(f"Saved optimized copy: {os.path.basename(new_filepath)}")
+        
+        if can_undo:
+            try:
+                with BrenderTimer("Undo Restoration Ops"):
+                    bpy.ops.ed.undo()
+                log.info("Master file state restored successfully.")
+            except Exception as e:
+                log.error(f"Failed to restore scenes after save: {e}")
 
 def apply_brender_optimizations(target_scene, use_simplify):
     """Applies general background configurations to the scene for the farm."""
@@ -512,8 +565,25 @@ def apply_brender_optimizations(target_scene, use_simplify):
         render.stamp_font_size = 12
 
 
+def _ensure_all_collections_enabled(view_layer):
+    fixed = []
+    def _walk(layer_col):
+        for child in layer_col.children:
+            if child.exclude:
+                child.exclude = False
+                fixed.append(child.name)
+            _walk(child)
+    _walk(view_layer.layer_collection)
+    return fixed
+
+
 def _prepare_shot_in_current_file(context, shot_marker):
     """Prepares the target scene for a given shot marker based on Output Format."""
+    with BrenderTimer(f"Prepare Shot - {shot_marker.name}"):
+        return _prepare_shot_in_current_file_impl(context, shot_marker)
+
+def _prepare_shot_in_current_file_impl(context, shot_marker):
+    """Internal implementation of shot preparation."""
     log.info(f"--- Starting preparation for shot: {shot_marker.name} ---")
 
     original_active_scene = get_active_scene_safe(context)
@@ -869,6 +939,10 @@ def _prepare_shot_in_current_file(context, shot_marker):
     # before we perform the destructive save. 
     # original_active_scene.frame_set(original_frame)
     
+    fixed = _ensure_all_collections_enabled(context.view_layer)
+    if fixed:
+        log.info(f"Re-enabled {len(fixed)} excluded collection(s) in '{source_scene.name}': {', '.join(fixed)}")
+
     set_active_scene_safe(context, target_scene)
 
     log.info(f"--- Successfully prepared shot: {shot_marker.name} ---")
@@ -1009,119 +1083,129 @@ def get_all_shots(context):
 
 def _purge_orphans():
     """Aggressively purges all orphaned data-blocks."""
-    log.info("Purging orphaned data-blocks...")
-    try:
-        purged_count = bpy.data.orphans_purge(do_recursive=True)
-        log.info(f"Purged {purged_count} orphaned data-blocks.")
-        purged_count_2 = bpy.data.orphans_purge(do_recursive=True)
-        if purged_count_2 > 0:
-            log.info(f"Purged an additional {purged_count_2} nested data-blocks.")
-    except Exception as e:
-        log.error(f"Error during orphan purge: {e}.")
+    with BrenderTimer("Purge Orphans"):
+        log.info("Purging orphaned data-blocks...")
+        try:
+            purged_count = bpy.data.orphans_purge(do_recursive=True)
+            log.info(f"Purged {purged_count} orphaned data-blocks.")
+            purged_count_2 = bpy.data.orphans_purge(do_recursive=True)
+            if purged_count_2 > 0:
+                log.info(f"Purged an additional {purged_count_2} nested data-blocks.")
+        except Exception as e:
+            log.error(f"Error during orphan purge: {e}.")
 
 # --- DEADLINE SUBMISSION HELPER ---
+# --- DEADLINE SUBMISSION HELPER ---
 def _submit_to_deadline(context, filepath, start_frame, end_frame, output_path, deadline_cmd):
-    """Submits a specific blend file to Deadline and logs the payload."""
+    """Submits a specific blend file to Deadline asynchronously using a background thread."""
+    priority = context.scene.brender_deadline_priority
+    pool = context.scene.brender_deadline_pool
+    sec_pool = context.scene.brender_deadline_secondary_pool
+    group = context.scene.brender_deadline_group
     
     # Path Sanitization: Ensure paths use the canonical drive letter (e.g., S:) on Windows
+    sanitized_filepath = filepath
+    sanitized_output_path = output_path
     if sys.platform.startswith("win"):
         os_bridge = get_os_bridge(context)
         if os_bridge:
             win_drive = os_bridge.get_win_config(context)
             if not filepath.upper().startswith(win_drive.upper()):
-                filepath = os_bridge.sanitize_windows_absolute(filepath, context)
-                log.info(f"[bRender] Sanitized SceneFile path for Deadline: {filepath}")
+                sanitized_filepath = os_bridge.sanitize_windows_absolute(filepath, context)
+                log.info(f"[bRender] Sanitized SceneFile path for Deadline: {sanitized_filepath}")
             if not output_path.upper().startswith(win_drive.upper()):
-                output_path = os_bridge.sanitize_windows_absolute(output_path, context)
-                log.info(f"[bRender] Sanitized Output path for Deadline: {output_path}")
+                sanitized_output_path = os_bridge.sanitize_windows_absolute(output_path, context)
+                log.info(f"[bRender] Sanitized Output path for Deadline: {sanitized_output_path}")
 
-    if not os.path.exists(deadline_cmd):
-        log.error(f"Deadline executable not found at: {deadline_cmd}")
-        return False
-
-    job_name = os.path.basename(filepath)
-    batch_name = job_name
-    
     major, minor = bpy.app.version[0], bpy.app.version[1]
     blender_version = f"{major}.{minor}"
 
-    total_frames = (end_frame - start_frame) + 1
-    chunk_size = total_frames + 5000 
+    t = threading.Thread(
+        target=_submit_to_deadline_thread,
+        args=(sanitized_filepath, start_frame, end_frame, sanitized_output_path, deadline_cmd, priority, pool, sec_pool, group, blender_version)
+    )
+    t.start()
+    return True
 
-    priority = context.scene.brender_deadline_priority
-    pool = context.scene.brender_deadline_pool
-    sec_pool = context.scene.brender_deadline_secondary_pool
-    group = context.scene.brender_deadline_group
+def _submit_to_deadline_thread(filepath, start_frame, end_frame, output_path, deadline_cmd, priority, pool, sec_pool, group, blender_version):
+    with BrenderTimer(f"Deadline Submission - {os.path.basename(filepath)}"):
+        if not os.path.exists(deadline_cmd):
+            log.error(f"Deadline executable not found at: {deadline_cmd}")
+            return
 
-    job_info = [
-        f"Name={job_name}",
-        f"BatchName={batch_name}",
-        "Plugin=Blender",
-        f"Frames={start_frame}-{end_frame}",
-        f"ChunkSize={chunk_size}",
-        f"Priority={priority}",
-        f"Pool={pool}",
-        f"SecondaryPool={sec_pool}",
-        f"Group={group}",
-        f"OutputDirectory0={os.path.dirname(output_path)}",
-        f"OutputFilename0={os.path.basename(output_path)}", 
-    ]
-
-    plugin_info = [
-        f"SceneFile={filepath}",
-        f"Version={blender_version}",
-        "Build=None",
-        "Threads=0",
-    ]
-
-    log.info("--- Deadline Job Payload ---")
-    for line in job_info: log.info(line)
-    log.info("----------------------------")
-
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".job", encoding='utf-8') as j_file:
-            j_file.write("\n".join(job_info))
-            j_job_path = j_file.name
+        job_name = os.path.basename(filepath)
+        batch_name = job_name
         
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".job", encoding='utf-8') as p_file:
-            p_file.write("\n".join(plugin_info))
-            p_plugin_path = p_file.name
+        total_frames = (end_frame - start_frame) + 1
+        chunk_size = total_frames + 5000 
 
-        log.info(f"Executing deadlinecommand for {job_name}...")
-        
-        startupinfo = None
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        job_info = [
+            f"Name={job_name}",
+            f"BatchName={batch_name}",
+            "Plugin=Blender",
+            f"Frames={start_frame}-{end_frame}",
+            f"ChunkSize={chunk_size}",
+            f"Priority={priority}",
+            f"Pool={pool}",
+            f"SecondaryPool={sec_pool}",
+            f"Group={group}",
+            f"OutputDirectory0={os.path.dirname(output_path)}",
+            f"OutputFilename0={os.path.basename(output_path)}", 
+        ]
 
-        process = subprocess.Popen(
-            [deadline_cmd, j_job_path, p_plugin_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            startupinfo=startupinfo
-        )
-        stdout, stderr = process.communicate()
+        plugin_info = [
+            f"SceneFile={filepath}",
+            f"Version={blender_version}",
+            "Build=None",
+            "Threads=0",
+        ]
+
+        log.info("--- Deadline Job Payload (Background Thread) ---")
+        for line in job_info: log.info(line)
+        log.info("----------------------------")
 
         try:
-            os.remove(j_job_path)
-            os.remove(p_plugin_path)
-        except:
-            pass
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".job", encoding='utf-8') as j_file:
+                j_file.write("\n".join(job_info))
+                j_job_path = j_file.name
+            
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".job", encoding='utf-8') as p_file:
+                p_file.write("\n".join(plugin_info))
+                p_plugin_path = p_file.name
 
-        if process.returncode == 0:
-            log.info("Deadline Submission Successful:")
-            log.info(stdout.strip())
-            return True
-        else:
-            log.error("Deadline Submission Failed:")
-            log.error(f"STDOUT:\n{stdout.strip()}")
-            log.error(f"STDERR:\n{stderr.strip()}")
-            return False
+            log.info(f"Executing deadlinecommand (Background) for {job_name}...")
+            
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
-    except Exception as e:
-        log.error(f"Exception during Deadline submission: {e}")
-        return False
+            with BrenderTimer(f"Deadline subprocess call (Background): {job_name}"):
+                process = subprocess.Popen(
+                    [deadline_cmd, j_job_path, p_plugin_path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    startupinfo=startupinfo
+                )
+                stdout, stderr = process.communicate()
+
+            try:
+                os.remove(j_job_path)
+                os.remove(p_plugin_path)
+            except:
+                pass
+
+            if process.returncode == 0:
+                log.info(f"Deadline Submission Successful for {job_name}:")
+                log.info(stdout.strip())
+            else:
+                log.error(f"Deadline Submission Failed for {job_name}:")
+                log.error(f"STDOUT:\n{stdout.strip()}")
+                log.error(f"STDERR:\n{stderr.strip()}")
+
+        except Exception as e:
+            log.error(f"Exception during background Deadline submission for {job_name}: {e}")
 
 # --- DATA STRUCTURE FOR SHOT LIST ---
 class BRENDER_ShotListItem(bpy.types.PropertyGroup):
@@ -1153,7 +1237,7 @@ class BRENDER_AddonPreferences(bpy.types.AddonPreferences):
     google_webapp_url: bpy.props.StringProperty(
         name="Google WebApp URL",
         description="The Web App URL from your deployed Google Apps Script",
-        default="https://script.google.com/macros/s/AKfycbxNBjD9rjBHgesVCxYpsH6J_m9qHt2ZL1n-ANGKxiuceOtF7pNV584ylJNOSTK55t5A/exec"
+        default="https://script.google.com/macros/s/KRUTART_REDACTED_APPS_SCRIPT_ID_3/exec"
     )
 
     default_deadline_path = r"C:\Program Files\Thinkbox\Deadline10\bin\deadlinecommand.exe"
@@ -1335,6 +1419,7 @@ class BRENDER_OT_prepare_active_shot(bpy.types.Operator):
         log.info("Preparation for active shot complete.")
         return {'FINISHED'}
 
+
 class BRENDER_OT_prepare_render_batch(bpy.types.Operator):
     bl_idname = "brender.prepare_render_batch"
     bl_label = "Prepare Batch From Selection"
@@ -1345,111 +1430,133 @@ class BRENDER_OT_prepare_render_batch(bpy.types.Operator):
             self.report({"ERROR"}, "Please save the main project file first.")
             return {"CANCELLED"}
 
-        original_scene = get_active_scene_safe(context)
-        original_scene_name = original_scene.name  
-        original_frame = original_scene.frame_current
-        
-        prefs = get_prefs(context)
-        deadline_cmd = prefs.deadline_path if prefs else ""
+        had_handler = False
+        if auto_refresh_shot_list in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.remove(auto_refresh_shot_list)
+            had_handler = True
+            log.info("Temporarily disabled auto_refresh_shot_list handler during batch preparation.")
 
-        # FIX: Store string names instead of live RNA objects
-        selected_shot_names = [s.name for s in context.scene.brender_shot_list if s.is_selected]
-        
-        if not selected_shot_names:
-            self.report({"WARNING"}, "No shots selected from the list.")
-            return {"CANCELLED"}
+        try:
+            original_scene = get_active_scene_safe(context)
+            original_scene_name = original_scene.name  
+            original_frame = original_scene.frame_current
+            
+            prefs = get_prefs(context)
+            deadline_cmd = prefs.deadline_path if prefs else ""
 
-        log.info(f"Starting batch preparation for {len(selected_shot_names)} shots.")
-        processed_count = 0
-        submitted_count = 0
+            # FIX: Store string names instead of live RNA objects
+            selected_shot_names = [s.name for s in context.scene.brender_shot_list if s.is_selected]
+            
+            if not selected_shot_names:
+                self.report({"WARNING"}, "No shots selected from the list.")
+                return {"CANCELLED"}
 
-        # Loop through the string names instead
-        for shot_name in selected_shot_names:
-            log.info(f"--- Preparing batch item: {shot_name} ---")
+            total_timer = BrenderTimer("Batch Prepare Render")
+            total_timer.start()
 
-            # Must re-fetch scene each loop iteration as it gets invalidated by Undo
-            current_fresh_scene = bpy.data.scenes.get(original_scene_name)
-            if not current_fresh_scene:
-                log.error("Original scene lost. Aborting batch.")
-                break
-                
-            shot_marker = current_fresh_scene.timeline_markers.get(shot_name)
-            if not shot_marker:
-                log.error(f"Marker '{shot_name}' not found. Skipping.")
-                continue
+            log.info(f"Starting batch preparation for {len(selected_shot_names)} shots.")
+            processed_count = 0
+            submitted_count = 0
 
-            success, source_scene, name_components = _prepare_shot_in_current_file(context, shot_marker)
+            # Loop through the string names instead
+            for shot_name in selected_shot_names:
+                log.info(f"--- Preparing batch item: {shot_name} ---")
 
-            if not success:
-                log.error(f"Preparation failed for '{shot_name}'. Skipping save.")
+                # Must re-fetch scene each loop iteration as it gets invalidated by Undo
+                current_fresh_scene = bpy.data.scenes.get(original_scene_name)
+                if not current_fresh_scene:
+                    log.error("Original scene lost. Aborting batch.")
+                    break
+                    
+                shot_marker = current_fresh_scene.timeline_markers.get(shot_name)
+                if not shot_marker:
+                    log.error(f"Marker '{shot_name}' not found. Skipping.")
+                    continue
+
+                success, source_scene, name_components = _prepare_shot_in_current_file(context, shot_marker)
+
+                if not success:
+                    log.error(f"Preparation failed for '{shot_name}'. Skipping save.")
+                    fresh_scene = bpy.data.scenes.get(original_scene_name)
+                    if fresh_scene: set_active_scene_safe(context, fresh_scene)
+                    continue
+
+                new_filepath = name_components.get('new_save_path')
+                version_str_out = name_components.get('version_str', 'v001')
+
+                if new_filepath:
+                    target_dir = os.path.dirname(new_filepath)
+                    attach_project_logger(target_dir)
+
+                    # Capture render settings BEFORE destructive save destroys the 'render' scene
+                    temp_render_scene = get_active_scene_safe(context)
+                    start_frame = temp_render_scene.frame_start
+                    end_frame = temp_render_scene.frame_end
+                    output_path = temp_render_scene.render.filepath
+
+                    _perform_destructive_save(
+                        context, 
+                        new_filepath, 
+                        source_scene.name, 
+                        context.scene.brender_output_format
+                    )
+                    
+                    upload_shot_data(
+                        context, 
+                        shot_name=shot_name, 
+                        filename=os.path.basename(new_filepath),
+                        version_str=version_str_out
+                    )
+
+                    submit_success = _submit_to_deadline(context, new_filepath, start_frame, end_frame, output_path, deadline_cmd)
+                    if submit_success:
+                        submitted_count += 1
+
+                    processed_count += 1
+                else:
+                    log.error(f"Could not generate filename for '{shot_name}'. Skipping save.")
+
+                # FIX: Fetch fresh reference after Undo to safely uncheck the item in the UI
                 fresh_scene = bpy.data.scenes.get(original_scene_name)
-                if fresh_scene: set_active_scene_safe(context, fresh_scene)
-                continue
+                if fresh_scene: 
+                    set_active_scene_safe(context, fresh_scene)
+                    
+                    # Safely find the UI list item in the new memory state and uncheck it
+                    fresh_shot_item = next((item for item in fresh_scene.brender_shot_list if item.name == shot_name), None)
+                    if fresh_shot_item:
+                        fresh_shot_item.is_selected = False
 
-            new_filepath = name_components.get('new_save_path')
-            version_str_out = name_components.get('version_str', 'v001')
-
-            if new_filepath:
-                target_dir = os.path.dirname(new_filepath)
-                attach_project_logger(target_dir)
-
-                # Capture render settings BEFORE destructive save destroys the 'render' scene
-                temp_render_scene = get_active_scene_safe(context)
-                start_frame = temp_render_scene.frame_start
-                end_frame = temp_render_scene.frame_end
-                output_path = temp_render_scene.render.filepath
-
-                _perform_destructive_save(
-                    context, 
-                    new_filepath, 
-                    source_scene.name, 
-                    context.scene.brender_output_format
-                )
-                
-                upload_shot_data(
-                    context, 
-                    shot_name=shot_name, 
-                    filename=os.path.basename(new_filepath),
-                    version_str=version_str_out
-                )
-
-                submit_success = _submit_to_deadline(context, new_filepath, start_frame, end_frame, output_path, deadline_cmd)
-                if submit_success:
-                    submitted_count += 1
-
-                processed_count += 1
-            else:
-                log.error(f"Could not generate filename for '{shot_name}'. Skipping save.")
-
-            # FIX: Fetch fresh reference after Undo to safely uncheck the item in the UI
+            # --- Restoration ---
             fresh_scene = bpy.data.scenes.get(original_scene_name)
-            if fresh_scene: 
+            if fresh_scene:
                 set_active_scene_safe(context, fresh_scene)
-                
-                # Safely find the UI list item in the new memory state and uncheck it
-                fresh_shot_item = next((item for item in fresh_scene.brender_shot_list if item.name == shot_name), None)
-                if fresh_shot_item:
-                    fresh_shot_item.is_selected = False
+                fresh_scene.frame_set(original_frame)
+            
+            temp_render = bpy.data.scenes.get("render")
+            if temp_render:
+                try:
+                    bpy.data.scenes.remove(temp_render)
+                    log.info("Cleaned up temporary 'render' scene left over in active file.")
+                except Exception as e:
+                    log.error(f"Error cleaning up 'render' scene: {e}")
 
-        # --- Restoration ---
-        fresh_scene = bpy.data.scenes.get(original_scene_name)
-        if fresh_scene:
-            set_active_scene_safe(context, fresh_scene)
-            fresh_scene.frame_set(original_frame)
-        
-        temp_render = bpy.data.scenes.get("render")
-        if temp_render:
-            try:
-                bpy.data.scenes.remove(temp_render)
-                log.info("Cleaned up temporary 'render' scene left over in active file.")
-            except Exception as e:
-                log.error(f"Error cleaning up 'render' scene: {e}")
+            total_timer.stop()
+            if processed_count > 0:
+                avg_duration = total_timer.elapsed / processed_count
+                log.info(f"[Perf] Batch Summary: Total Elapsed: {total_timer.elapsed:.4f}s | Processed: {processed_count} shots | Average time per shot: {avg_duration:.4f}s")
+            else:
+                log.info(f"[Perf] Batch Summary: Total Elapsed: {total_timer.elapsed:.4f}s | No shots processed.")
 
-        msg = f"Batch complete. Saved {processed_count} files. Submitted {submitted_count} to Deadline."
-        log.info(f"--- {msg} ---")
-        self.report({'INFO'}, msg)
+            msg = f"Batch complete. Saved {processed_count} files. Submitted {submitted_count} to Deadline."
+            log.info(f"--- {msg} ---")
+            self.report({'INFO'}, msg)
 
-        return {'FINISHED'}
+            return {'FINISHED'}
+        finally:
+            if had_handler:
+                if auto_refresh_shot_list not in bpy.app.handlers.depsgraph_update_post:
+                    bpy.app.handlers.depsgraph_update_post.append(auto_refresh_shot_list)
+                log.info("Re-enabled auto_refresh_shot_list handler after batch preparation.")
 
 # --- HANDLERS (AUTO-REFRESH) ---
 @persistent
@@ -1504,8 +1611,16 @@ class VIEW3D_PT_brender_panel(bpy.types.Panel):
 
         # --- NEW: Phase Toggle for Production ---
         if _is_production(context):
-            row = box.row(align=True)
-            row.prop(scene, "brender_render_phase", expand=True)
+            dash_row = box.row(align=True)
+            dash_row.label(text=f"DAB: {DASH_FETCH_STATUS}", icon='URL')
+            dash_row.operator("brender.refresh_dash", icon='FILE_REFRESH', text="")
+
+            # Phase toggle: all six phases in a 2-column x 3-row grid.
+            phase_grid = box.column(align=True)
+            for _i in range(0, len(PHASE_ITEMS), 2):
+                phase_row = phase_grid.row(align=True)
+                for _phase_id, _phase_name, _phase_desc in PHASE_ITEMS[_i:_i + 2]:
+                    phase_row.prop_enum(scene, 'brender_render_phase', _phase_id, text=_phase_name)
             box.separator()
 
         row = box.row(align=True)
@@ -2069,29 +2184,171 @@ classes = (
     VIEW3D_PT_brender_debug_panel,
 )
 
+# --- DAB DASHBOARD SYNC (ported from krutart-publisher.py) ---
+DAB_SPREADSHEET_ID = '1HxVVFK2ixML5MHv83ZhOXrUQNsgw6rpwoWHVMm9UZJc'
+DAB_GID = '649829434'
+DAB_CSV_URL = f"https://docs.google.com/spreadsheets/d/{DAB_SPREADSHEET_ID}/export?format=csv&gid={DAB_GID}"
+
+CACHED_DASH_DATA = {}
+DASH_FETCH_STATUS = "Ready"
+
+DAB_PHASE_ORDER = ['BLK', 'FCM', 'ANI', 'STD', 'VFX', 'LGT']
+DAB_TAG_TO_PHASE = {
+    'BLK': 'blocking', 'FCM': 'fincam', 'ANI': 'animation',
+    'STD': 'setdress', 'VFX': 'vfx', 'LGT': 'lighting',
+}
+_MASTER_STATUS_PHASE_INDEX = {
+    'BLK': 0, 'FCM': 1, 'ANI': 3, 'STD': 5, 'VFX': 6, 'LGT': 7,
+}
+_INACTIVE_STATUSES = ('done', 'skip', 'not ready', 'pending parent', 'pending phase')
+
+# The six togglable production phases, ordered by pipeline chronology
+# (VR1 -> VR2 -> VR3). Shared by the render-phase enum and the UI grid.
+PHASE_ITEMS = [
+    ('blocking', 'Blocking', 'Ani: Animation Blocking phase'),
+    ('fincam', 'FinCam', 'Ani: Final Camera phase'),
+    ('animation', 'Animation', 'Ani: Animation phase'),
+    ('setdress', 'Setdress', 'Art: Setdress phase'),
+    ('vfx', 'VFX', 'Art: VFX phase'),
+    ('lighting', 'Lighting', 'Art: Lighting phase'),
+]
+
+
+class GoogleCSVClient:
+    @staticmethod
+    def fetch_dash_data():
+        global CACHED_DASH_DATA, DASH_FETCH_STATUS
+        try:
+            log.info(f"Fetching DAB Dashboard from: {DAB_CSV_URL}")
+            response = urllib.request.urlopen(DAB_CSV_URL, timeout=10)
+            data = response.read().decode('utf-8')
+            # The DAB sheet has banner rows (title + VR-group) above the real
+            # header row. Locate the header row containing 'SHOT ID' so the
+            # fetch survives minor layout changes in the live sheet.
+            lines = data.splitlines()
+            header_idx = 0
+            for i, line in enumerate(lines[:6]):
+                if 'shot id' in line.lower():
+                    header_idx = i
+                    break
+            f = io.StringIO('\n'.join(lines[header_idx:]))
+            reader = csv.DictReader(f)
+            new_data = {}
+            for row in reader:
+                shot_id = row.get('SHOT ID', '').strip()
+                if shot_id:
+                    new_data[shot_id] = row
+            CACHED_DASH_DATA = new_data
+            DASH_FETCH_STATUS = "Synced"
+            log.info(f"Dashboard synced successfully. {len(new_data)} shots loaded.")
+            return True
+        except Exception as e:
+            DASH_FETCH_STATUS = f"Error: {str(e)}"
+            log.error(f"Failed to fetch dashboard: {e}")
+            return False
+
+
+def _normalize_shot_key(shot_id):
+    """Match shots by sc/sh numbers: production filenames use 'SC11-SH080'
+    while DAB SHOT IDs are 'sc11-telescope-sh080'."""
+    if not shot_id:
+        return None
+    m = re.search(r'sc0*(\d+).*?sh0*(\d+)', shot_id, re.IGNORECASE)
+    if not m:
+        return None
+    return 'sc' + str(int(m.group(1))).zfill(2), 'sh' + str(int(m.group(2))).zfill(3)
+
+
+def _is_phase_in_progress(status):
+    s = (status or '').strip().lower()
+    if not s or s in _INACTIVE_STATUSES or s.startswith('not in'):
+        return False
+    return True
+
+
+def get_active_phase_for_shot(shot_id):
+    """
+    Returns the chronologically highest phase currently in progress for a shot,
+    derived from the DAB MASTER STATUS column. Returns a lowercase phase word
+    or None.
+    """
+    if not CACHED_DASH_DATA:
+        return None
+    target = _normalize_shot_key(shot_id)
+    if target is None:
+        return None
+    row = None
+    for dab_shot_id, dab_row in CACHED_DASH_DATA.items():
+        if _normalize_shot_key(dab_shot_id) == target:
+            row = dab_row
+            break
+    if row is None:
+        return None
+    master_status = (row.get('MASTER STATUS') or '').strip()
+    if not master_status:
+        return None
+    parts = [p.strip() for p in master_status.split(';')]
+    highest_tag = None
+    highest_rank = -1
+    for tag, idx in _MASTER_STATUS_PHASE_INDEX.items():
+        if idx >= len(parts) or not _is_phase_in_progress(parts[idx]):
+            continue
+        rank = DAB_PHASE_ORDER.index(tag)
+        if rank > highest_rank:
+            highest_rank = rank
+            highest_tag = tag
+    if highest_tag is None:
+        return None
+    return DAB_TAG_TO_PHASE[highest_tag].lower()
+
+
+@persistent
+def auto_switch_phase_on_load(dummy):
+    """Triggered on file load to sync the render phase with the DAB dashboard."""
+    GoogleCSVClient.fetch_dash_data()
+    active_phase = get_active_phase_for_shot(bpy.data.filepath)
+    if active_phase:
+        for scene in bpy.data.scenes:
+            try:
+                scene.brender_render_phase = active_phase
+                log.info(f"Auto-switched render phase to: {active_phase}")
+            except Exception as e:
+                log.warning(f"Could not auto-switch render phase to '{active_phase}': {e}")
+
+
+class BRENDER_OT_refresh_dash(bpy.types.Operator):
+    """Refresh the DAB dashboard data and re-sync the render phase."""
+    bl_idname = "brender.refresh_dash"
+    bl_label = "Refresh DAB"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        GoogleCSVClient.fetch_dash_data()
+        active_phase = get_active_phase_for_shot(bpy.data.filepath)
+        if active_phase:
+            try:
+                context.scene.brender_render_phase = active_phase
+                self.report({'INFO'}, f"Phase: {active_phase}")
+            except Exception as e:
+                self.report({'WARNING'}, f"Phase '{active_phase}' unavailable: {e}")
+        else:
+            self.report({'INFO'}, "No active phase in DAB")
+        return {'FINISHED'}
+
+
 # --- PHASE PROPERTY HELPERS ---
 def get_render_phase_items(self, context):
     """
-    Detects the work line (ANI or ART) from the file path and returns appropriate phases.
-    Matches the logic used in the Publisher addon for consistency.
+    Returns all six production phases for the render toggle, ordered by the
+    pipeline chronology (VR1 -> VR2 -> VR3). Mirrors the Publisher addon and
+    the sheets-side phase hierarchy (render_data_sync.js / production_workflow.js).
     """
-    filepath = bpy.data.filepath.lower()
-    
-    if "-art-" in filepath or "art-work" in filepath:
-        return [
-            ('setdress', 'Setdress', 'Art: Setdress phase'),
-            ('lighting', 'Lighting', 'Art: Lighting phase'),
-        ]
-    else:
-        # Default to ANI
-        return [
-            ('blocking', 'Blocking', 'Ani: Animation Blocking phase'),
-            ('fincam', 'FinCam', 'Ani: Final Camera phase'),
-        ]
+    return PHASE_ITEMS
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    bpy.utils.register_class(BRENDER_OT_refresh_dash)
 
     bpy.types.Scene.brender_shot_list = bpy.props.CollectionProperty(type=BRENDER_ShotListItem)
     bpy.types.Scene.brender_active_shot_index = bpy.props.IntProperty()
@@ -2133,6 +2390,9 @@ def register():
     
     if debug_path_on_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(debug_path_on_load)
+
+    if auto_switch_phase_on_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(auto_switch_phase_on_load)
         
     log.info("bRender addon registered successfully.")
 
@@ -2144,6 +2404,9 @@ def unregister():
 
     if debug_path_on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(debug_path_on_load)
+
+    if auto_switch_phase_on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(auto_switch_phase_on_load)
 
     del bpy.types.Scene.brender_deadline_pool
     del bpy.types.Scene.brender_deadline_secondary_pool
@@ -2157,6 +2420,7 @@ def unregister():
     del bpy.types.Scene.brender_active_shot_index
     del bpy.types.Scene.brender_shot_list
 
+    bpy.utils.unregister_class(BRENDER_OT_refresh_dash)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     log.info("bRender addon unregistered.")

@@ -393,22 +393,30 @@ class KA_OT_apply_config(Operator):
         return {'FINISHED'}
 
 class KA_OT_set_simplify(Operator):
-    """Set native viewport subdivision simplify level"""
+    """Set native simplify max subdivision for both viewport and render"""
     bl_idname = "ka.set_simplify"
     bl_label = "Set Simplify"
     bl_options = {'UNDO'}
 
     level: StringProperty()
+    render_level: StringProperty()
 
     def execute(self, context):
         scene = context.scene
         if self.level == "OFF":
             scene.render.use_simplify = False
             self.report({'INFO'}, "Simplify Disabled")
-        else:
-            scene.render.use_simplify = True
-            scene.render.simplify_subdivision = int(self.level)
-            self.report({'INFO'}, f"Simplify Enabled: Viewport Subdiv set to {self.level}")
+            return {"FINISHED"}
+
+        scene.render.use_simplify = True
+        viewport_level = int(self.level)
+        # An empty render_level means "match the viewport level" rather than
+        # silently leaving simplify_subdivision_render at its default of 6,
+        # which would make the preset a viewport-only change.
+        render_level = int(self.render_level) if self.render_level else viewport_level
+        scene.render.simplify_subdivision = viewport_level
+        scene.render.simplify_subdivision_render = render_level
+        self.report({'INFO'}, f"Simplify Enabled: Viewport Subdiv {viewport_level}, Render Subdiv {render_level}")
         return {"FINISHED"}
 
 # -------------------------------------------------------------------------------------------------
@@ -459,12 +467,37 @@ class KA_PT_render_settings(Panel):
                 
         # --- SIMPLIFY ---
         layout.separator()
-        layout.label(text="Simplify:")
+        rd = context.scene.render
+        layout.prop(rd, "use_simplify", text="Simplify")
+
         row = layout.row(align=True)
         row.operator("ka.set_simplify", text="Off").level = "OFF"
-        row.operator("ka.set_simplify", text="0").level = "0"
-        row.operator("ka.set_simplify", text="1").level = "1"
-        row.operator("ka.set_simplify", text="2").level = "2"
+        for lvl in ("0", "1", "2"):
+            op = row.operator("ka.set_simplify", text=lvl)
+            op.level = lvl
+            op.render_level = lvl
+
+        box = layout.box()
+        box.enabled = rd.use_simplify
+        cycles = getattr(context.scene, "cycles", None)
+
+        col = box.column(align=True)
+        col.label(text="Viewport:")
+        col.prop(rd, "simplify_subdivision", text="Max Subdivision")
+        col.prop(rd, "simplify_child_particles", text="Child Particles")
+        if cycles:
+            col.prop(cycles, "texture_limit", text="Texture Limit")
+
+        col = box.column(align=True)
+        col.label(text="Render:")
+        col.prop(rd, "simplify_subdivision_render", text="Max Subdivision")
+        col.prop(rd, "simplify_child_particles_render", text="Child Particles")
+        if cycles:
+            col.prop(cycles, "texture_limit_render", text="Texture Limit")
+
+        col = box.column(align=True)
+        col.prop(rd, "simplify_volumes", text="Volume Resolution")
+        col.prop(rd, "use_simplify_normals", text="Normals")
         
         # --- HIDDEN HANDLES UI ---
         # layout.separator()
