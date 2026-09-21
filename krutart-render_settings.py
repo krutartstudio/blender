@@ -31,7 +31,7 @@ from bpy.types import Operator, Panel, AddonPreferences
 # -------------------------------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -------------------------------------------------------------------------------------------------
-DEFAULT_SPREADSHEET_ID = '1v_D4aEYObApIydC43SUlOSNtQAO0MqrxYSDKJwyNX3o'
+DEFAULT_SPREADSHEET_ID = 'KRUTART_REDACTED_SHEET_ID_3'
 DEFAULT_SHEET_NAME = 'render_settings' 
 
 COL_DEFAULT_NAME = 'default_name'

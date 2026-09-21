@@ -27,7 +27,7 @@ import time
 from bpy.app.handlers import persistent
 
 # --- Constants ---
-DAB_SPREADSHEET_ID = '1HxVVFK2ixML5MHv83ZhOXrUQNsgw6rpwoWHVMm9UZJc'
+DAB_SPREADSHEET_ID = 'KRUTART_REDACTED_SHEET_ID_2'
 DAB_GID = '649829434'
 DAB_CSV_URL = f"https://docs.google.com/spreadsheets/d/{DAB_SPREADSHEET_ID}/export?format=csv&gid={DAB_GID}"
 # WebApp URLs - Default fallback values
