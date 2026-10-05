@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Krutart Light Link",
     "author": "iori, Krutart, Gemini",
-    "version": (2, 7, 1),
+    "version": (2, 7, 4),
     "blender": (4, 2, 0),
     "location": "Properties > Object & Collection > Light Linking",
     "description": "Manages default light (LL-) and shadow (SL-) link groups for assets via a cascading lookup system linked with Google Sheets preproduction data.",
@@ -65,10 +65,12 @@ class LinkChannel:
         self.light_prop = light_prop      # the light's pointer in Object.light_linking
         self.sheet_header = sheet_header  # ASL column
         self.standard = standard          # groups every ART file gets up front
-        self.lightgroups = lightgroups    # register as View Layer lightgroups (render passes)
+        self.lightgroups = lightgroups    # register as View Layer lightgroups (render passes); off for all channels since 2.7.2
 
+# lightgroups=False (2.7.2, Jorik 2026-09-21): LL- groups are no longer render passes. No object is ever
+# assigned to them, so the passes rendered empty while every file opened with the add-on carried ~15 of them.
 LIGHT = LinkChannel("LIGHT", "LL-", "Light", "LL GROUPS", "receiver_collection", "LIGHT LINK",
-                    STANDARD_LIGHT_GROUPS, True)
+                    STANDARD_LIGHT_GROUPS, False)
 # Shadow links are the exception, not the rule: no groups up front, no lightgroups, default none.
 SHADOW = LinkChannel("SHADOW", "SL-", "Shadow", "SL GROUPS", "blocker_collection", "SHADOW LINK",
                      (), False)
@@ -214,6 +216,49 @@ def save_object_delta(obj, delta):
             obj.id_properties_ui(CUSTOM_PROP_DELTA).update(description="cp")
         except Exception:
             pass
+
+LOCAL_BLOCK_NAME = "__krutart_light_link_local.json"
+
+def linked_key(obj):
+    """Identity of a linked object inside this file: its library file plus its name."""
+    lib = bpy.path.basename(obj.library.filepath).lower() if obj.library else ""
+    return f"{lib}|{obj.name}"
+
+def _local_store(create=False):
+    """This file's record of edits that cannot be stored on the datablock itself."""
+    text = bpy.data.texts.get(LOCAL_BLOCK_NAME)
+    if text is None:
+        if not create:
+            return {}, None
+        text = bpy.data.texts.new(LOCAL_BLOCK_NAME)
+    try:
+        data = json.loads(text.as_string()) if text.as_string().strip() else {}
+    except Exception:
+        data = {}
+    return (data if isinstance(data, dict) else {}), text
+
+def get_linked_removed(obj):
+    """Groups a user took a linked object out of here. Linked objects cannot store their own list."""
+    if not obj.library:
+        return []
+    data, _ = _local_store()
+    return list(data.get("linked_removed", {}).get(linked_key(obj), []))
+
+def set_linked_removed(obj, groups):
+    data, text = _local_store(create=True)
+    removed = data.setdefault("linked_removed", {})
+    key = linked_key(obj)
+    if groups:
+        removed[key] = sorted(set(groups))
+    else:
+        removed.pop(key, None)
+    if not removed:
+        data.pop("linked_removed", None)
+    try:
+        text.clear()
+        text.write(json.dumps(data, indent=1))
+    except Exception as e:
+        log.warning(f"Could not save the local light link record: {e}")
 
 def get_prefs():
     """Returns this add-on's preferences, or None if it is not registered under __name__."""
@@ -1258,8 +1303,8 @@ _ll_groups_ready = False
 def ensure_light_groups_initialized(scene=None, view_layer=None, force=False):
     """
     Ensures every LLCOL group (hero library + the 14 standard names) exists as a protected
-    (fake-user) collection datablock, registers the whole LL- pool - custom groups included - in
-    view_layer.lightgroups, then keeps all of them out of the outliner.
+    (fake-user) collection datablock, registers the pool of every channel whose `lightgroups` flag
+    is set in view_layer.lightgroups (none since 2.7.2), then keeps all of them out of the outliner.
 
     Cached behind _ll_groups_ready so the per-object sync path stays cheap; pass force=True
     after a file load, a scene change or an append to rebuild unconditionally.
@@ -1285,18 +1330,17 @@ def ensure_light_groups_initialized(scene=None, view_layer=None, force=False):
                 col.use_fake_user = True
 
     # view_layer.lightgroups is a read-only collection - the only way to add an entry is the
-    # scene operator, which acts on the view layer in the given context.
-    #
-    # TODO(future): this registers every LL- group as a View Layer lightgroup in EVERY file opened
-    # with the add-on (ANI, layout, ...), not only lighting files. In Cycles each lightgroup is a
-    # render pass, so those files also carry ~15 extra passes (EXR size, compositor setup).
-    # Decide whether to gate this on lighting files (e.g. a +LGT+ container being present) or to
-    # move lightgroup registration back to the manual "Init Light Groups" dev tool.
-    if view_layer and hasattr(view_layer, "lightgroups"):
+    # scene operator, which acts on the view layer in the given context. Lightgroups that files
+    # already carry from earlier versions are left alone (Clean Up LL Light Groups removes them).
+    wanted = set()
+    for channel in CHANNELS:
+        if channel.lightgroups:
+            wanted |= get_group_pool_names(channel)
+    if wanted and view_layer and hasattr(view_layer, "lightgroups"):
         if not scene:
             scene = getattr(bpy.context, "scene", None)
         existing = {lg.name for lg in view_layer.lightgroups}
-        missing = sorted(get_group_pool_names(LIGHT) - existing)  # SL- groups are never render passes
+        missing = sorted(wanted - existing)
         if missing:
             try:
                 with bpy.context.temp_override(scene=scene, view_layer=view_layer):
@@ -1581,9 +1625,10 @@ def sync_scene_objects_from_defaults(scene, asl_defaults):
                 groups = asl_defaults.get(matched_key, [])
                 settings = obj.krutart_light_link
                 if obj.library:
-                    # Read-only: can only gain membership.
+                    # Read-only: can only gain membership, and never one removed here by hand.
+                    removed_here = get_linked_removed(obj)
                     for g in groups:
-                        if is_light_group_name(g):
+                        if is_light_group_name(g) and g not in removed_here:
                             link_to_group(obj, g)
                     continue
                 adopt_native_memberships(obj)
@@ -1742,8 +1787,9 @@ def sync_existing_assignments(scene):
         if settings is None:
             continue
         if obj.library:
+            removed_here = get_linked_removed(obj)
             for g in get_groups(settings):
-                if is_light_group_name(g):
+                if is_light_group_name(g) and g not in removed_here:
                     link_to_group(obj, g)
             continue
         try:
@@ -2482,7 +2528,12 @@ def object_group_rows(obj, channel=None):
     """
     settings = getattr(obj, "krutart_light_link", None)
     stored = get_groups(settings) if settings else []
-    rows = set(stored) | current_ll_memberships(obj)
+    if is_read_only_object(obj):
+        # The list on a linked object comes from its library and cannot be edited here, so showing it
+        # would keep rows the user has just removed. Membership is what renders and what we can change.
+        rows = current_ll_memberships(obj)
+    else:
+        rows = set(stored) | current_ll_memberships(obj)
     if channel is None:
         return sorted(rows)
     if channel is LIGHT:
@@ -2493,6 +2544,9 @@ def add_group_to_object(obj, group_name):
     """Appends group_name to the object's list and syncs delta + collection membership. Returns False if already present."""
     if is_read_only_object(obj):
         # Linked object: membership is all it can be given.
+        removed = get_linked_removed(obj)
+        if group_name in removed:
+            set_linked_removed(obj, [g for g in removed if g != group_name])
         return link_to_group(obj, group_name)
     settings = obj.krutart_light_link
     groups = get_groups(settings)
@@ -2704,6 +2758,10 @@ class KRUTART_OT_remove_group_item(Operator):
         if not is_read_only_object(obj):
             set_groups(settings, [g for g in groups if g != name])
             sync_delta_from_ui(obj)
+        else:
+            # Remember it here: the library list stays as it is, and the automatic syncs would
+            # otherwise put the object straight back into the group.
+            set_linked_removed(obj, get_linked_removed(obj) + [name])
 
         # Membership is the part that renders, and the only part a linked object has.
         col = bpy.data.collections.get(name)
@@ -2735,14 +2793,30 @@ class KRUTART_PT_light_link_panel(Panel):
             box.operator("krutart.cleanup_light_groups", icon='TRASH', text="Clean Up LL Light Groups")
         box.operator("krutart.initialize_light_groups", icon='LIGHT_DATA', text="Init Light Groups Anyway")
 
+    # 2.7.4: the panel is drawn in three parts so other UIs (Krutart Interface, Tool > Lighting >
+    # Light Links) can show them as separate sub-panels. draw_panel_content draws exactly what it did
+    # before 2.7.4: light groups, the collapsible SL GROUPS box, then setup.
+    @staticmethod
+    def object_ui_active(obj):
+        """True when the per-object parts (groups, shadow groups, setup) apply to obj."""
+        return bool(obj) and is_art_file()
+
     @classmethod
     def draw_panel_content(cls, layout, context, obj):
+        if not cls.draw_light_groups(layout, context, obj):
+            return
+        cls.draw_shadow_section(layout, obj, is_read_only_object(obj))
+        cls.draw_setup(layout, context)
+
+    @classmethod
+    def draw_light_groups(cls, layout, context, obj):
+        """LL GROUPS list + Add Group / Revert. False when the rest of the panel does not apply."""
         if not is_art_file():
             cls.draw_non_art(layout)
-            return
+            return False
         if not obj:
             layout.label(text="Select an object.")
-            return
+            return False
 
         settings = obj.krutart_light_link
         delta = get_object_delta(obj)
@@ -2766,19 +2840,33 @@ class KRUTART_PT_light_link_panel(Panel):
         row_actions.menu("KRUTART_MT_add_light_group", text="Add Group", icon='ADD')
         if delta["added"] or delta["removed"]:
             row_actions.operator("krutart.revert_to_library", icon='LOOP_BACK', text="Revert to Defaults")
+        return True
 
-        cls.draw_shadow_section(layout, obj, read_only)
-
+    @classmethod
+    def draw_setup(cls, layout, context):
+        """Append LGT File, plus the developer tools when they are switched on."""
         layout.operator("krutart.append_lgt_structure", icon='FILE_BLEND', text="Append LGT File...")
-
         cls.draw_dev_tools(layout, context)
+
+    @staticmethod
+    def shadow_state(obj):
+        """(is_light, blocker collection, SL rows) of obj."""
+        is_light = obj.type == 'LIGHT'
+        blocker = getattr(obj.light_linking, SHADOW.light_prop, None) if is_light else None
+        rows = [] if is_light else object_group_rows(obj, SHADOW)
+        return is_light, blocker, rows
+
+    @classmethod
+    def shadow_count(cls, obj):
+        """Number shown next to SL GROUPS: 1 for a light with a blocker, else the object's SL rows."""
+        _, blocker, rows = cls.shadow_state(obj)
+        return 1 if blocker else len(rows)
 
     @staticmethod
     def draw_shadow_section(layout, obj, read_only):
         """SL GROUPS: always there, collapsed unless the object (or light) already has shadow data."""
-        is_light = obj.type == 'LIGHT'
-        blocker = getattr(obj.light_linking, SHADOW.light_prop, None) if is_light else None
-        rows = [] if is_light else object_group_rows(obj, SHADOW)
+        panel = KRUTART_PT_light_link_panel
+        is_light, blocker, rows = panel.shadow_state(obj)
         has_content = bool(rows or blocker)
         key = obj.name_full
         is_open = _section_open.get(key, has_content)
@@ -2792,7 +2880,14 @@ class KRUTART_PT_light_link_panel(Panel):
         header.label(text=SHADOW.section + (f" ({count})" if count else ""))
         if not is_open:
             return
+        panel.draw_shadow_body(box, obj, read_only)
 
+    @staticmethod
+    def draw_shadow_body(box, obj, read_only=None):
+        """The SL GROUPS content without its collapsible header."""
+        if read_only is None:
+            read_only = is_read_only_object(obj)
+        is_light, blocker, rows = KRUTART_PT_light_link_panel.shadow_state(obj)
         if is_light:
             row = box.row(align=True)
             row.label(text=f"Shadows from: {blocker.name if blocker else 'all objects'}",
