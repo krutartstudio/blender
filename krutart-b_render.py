@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Krutart bRender + Deadline + Sheets",
     "author": "iori, Krutart, Gemini",
-    "version": (5, 1, 6),
+    "version": (5, 1, 10),
     "blender": (4, 5, 0),
     "location": "3D View > Sidebar > bRender",
     "description": "Prepares render files, submits to Deadline, and logs to Google Sheets.",
@@ -44,6 +44,370 @@ if not log.handlers:
     handler.setFormatter(formatter)
     log.addHandler(handler)
 log.setLevel(logging.INFO)
+
+# --- FIELD LOG (central error log, 5.1.9) ---
+# So a broken release shows up without waiting for an artist to report it. Appends to
+#   <company root>/SOFTWARE/BLENDER/ADDON_LOGS/b_render/<YYYY-MM-DD>/<host>__<user>.log
+# (Windows: S:\\3212-PREPRODUCTION\\SOFTWARE\\BLENDER\\ADDON_LOGS\\...; the folder next to the company ADDON folder,
+# found through the Configurator). What is written: every WARNING / ERROR of this add-on, every uncaught exception
+# of its operators with the traceback, and a few audit lines (session start and the key decisions).
+# One file per machine and day = a single writer, so the Drive sync never merges two writers.
+# The log can never break the add-on: any failure is swallowed after one console line per session.
+import logging as _fl_logging
+import traceback as _fl_traceback
+import socket as _fl_socket
+import getpass as _fl_getpass
+
+FIELD_LOG_ADDON = "b_render"
+FIELD_LOG_ENV = "KRUTART_ADDON_LOG_DIR"        # overrides the folder (tests)
+_FIELD_LOCK = threading.Lock()
+_FIELD_STATE = {"root": None, "warned": False, "ctx": "", "seen": {}}
+FIELD_REPEAT_WINDOW_S = 600   # the same level + message is written at most once per 10 minutes (UI redraws repeat)
+
+
+def _field_log_root():
+    env = os.environ.get(FIELD_LOG_ENV)
+    if env:
+        return env
+    if _FIELD_STATE["root"]:
+        return _FIELD_STATE["root"]
+    base = None
+    conf = sys.modules.get("krutart-configurator")
+    getter = getattr(conf, "get_company_addon_path", None)
+    if callable(getter):
+        try:
+            p = getter()
+            base = os.path.dirname(str(p).rstrip("\\/")) if p else None
+        except Exception:
+            base = None
+    if not base and sys.platform.startswith("win"):
+        base = r"S:\3212-PREPRODUCTION\SOFTWARE\BLENDER"
+    if not base or not os.path.isdir(base):
+        return None
+    _FIELD_STATE["root"] = os.path.join(base, "ADDON_LOGS")
+    return _FIELD_STATE["root"]
+
+
+def _field_log_file():
+    root = _field_log_root()
+    if not root:
+        return None
+    try:
+        user = _fl_getpass.getuser()
+    except Exception:
+        user = "unknown"
+    host = _fl_socket.gethostname().split(".")[0]
+    safe = lambda v: "".join(c if c.isalnum() or c in "-_" else "_" for c in str(v))[:40]
+    folder = os.path.join(root, FIELD_LOG_ADDON, time.strftime("%Y-%m-%d"))
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, f"{safe(host)}__{safe(user)}.log")
+
+
+class _FieldLogHandler(_fl_logging.Handler):
+    """WARNING and above, plus records logged with extra={"field": True}. Thread-safe; never raises."""
+    def emit(self, record):
+        try:
+            if record.levelno < _fl_logging.WARNING and not getattr(record, "field", False):
+                return
+            msg = record.getMessage()
+            now = time.time()
+            with _FIELD_LOCK:
+                key = (record.levelno, msg)
+                last, skipped = _FIELD_STATE["seen"].get(key, (0.0, 0))
+                if now - last < FIELD_REPEAT_WINDOW_S and not record.exc_info:
+                    _FIELD_STATE["seen"][key] = (last, skipped + 1)
+                    return
+                _FIELD_STATE["seen"][key] = (now, 0)
+            if skipped:
+                msg += f"  [repeated {skipped}x in the previous {FIELD_REPEAT_WINDOW_S // 60} min, not written]"
+            path = _field_log_file()
+            if not path:
+                return
+            line = (f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{record.levelname}\t{_FIELD_STATE['ctx']}\t"
+                    f"{msg}")
+            if record.exc_info:
+                line += "\n" + "".join(_fl_traceback.format_exception(*record.exc_info))
+            with _FIELD_LOCK:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(line.rstrip("\n") + "\n")
+        except Exception as e:
+            if not _FIELD_STATE["warned"]:
+                _FIELD_STATE["warned"] = True
+                print(f"[{FIELD_LOG_ADDON}] field log unavailable ({e!r}); continuing without it.")
+
+
+def field(msg):
+    """An audit line for the field log (also printed like any INFO line)."""
+    log.info(msg, extra={"field": True})
+
+
+def _field_log_attach(version):
+    _FIELD_STATE["ctx"] = (f"{FIELD_LOG_ADDON} {'.'.join(map(str, version))} | Blender {bpy.app.version_string}"
+                           f"{' (background)' if bpy.app.background else ''}")
+    for h in list(log.handlers):
+        if type(h).__name__ == "_FieldLogHandler":
+            log.removeHandler(h)
+    log.addHandler(_FieldLogHandler())
+
+
+def _field_log_detach():
+    for h in list(log.handlers):
+        if type(h).__name__ == "_FieldLogHandler":
+            log.removeHandler(h)
+
+
+def _field_wrap_operators(classes):
+    """Uncaught exceptions in our operators go to the field log with the traceback, then propagate as before."""
+    for cls in classes:
+        try:
+            if not issubclass(cls, bpy.types.Operator):
+                continue
+        except TypeError:
+            continue
+        for meth in ("execute", "invoke"):
+            orig = cls.__dict__.get(meth)
+            if orig is None or getattr(orig, "_field_wrapped", False):
+                continue
+            def make(orig=orig, name=getattr(cls, "bl_idname", cls.__name__), meth=meth):
+                def wrapped(self, context, *args, **kwargs):
+                    try:
+                        return orig(self, context, *args, **kwargs)
+                    except Exception:
+                        log.exception(f"Operator {name}.{meth} raised")
+                        raise
+                wrapped._field_wrapped = True
+                wrapped.__name__ = orig.__name__
+                wrapped.__doc__ = orig.__doc__
+                return wrapped
+            setattr(cls, meth, make())
+
+
+# --- FARM SAFETY (5.1.8): missing-texture fallback + pre-submit check ---
+# Only render files (basename ends in "_r.blend", the suffix bRender gives every file it
+# prepares) get the fallback handler. On a Deadline task (background) a problem that cannot
+# be fixed ends Blender with a readable "Error:" block instead of an opaque crash.
+FALLBACK_TEXTURE_PARTS = ("3212-PRODUCTION", "MISC", "FALLBACK", "3212-missing_texture.jpg")
+FALLBACK_TEXTURE_NAME = "KRUTART_SAFE_FALLBACK"
+PROJECT_ROOT_ANCHORS = ("3212-PRODUCTION", "3212-PREPRODUCTION")
+FARM_ABORT_EXIT_CODE = 1
+_IMAGE_FILE_SOURCES = {'FILE', 'SEQUENCE', 'TILED'}
+
+
+def _is_brender_render_file(filepath=None):
+    fp = bpy.data.filepath if filepath is None else filepath
+    return bool(fp) and os.path.basename(fp).lower().endswith("_r.blend")
+
+
+def _split_path(path):
+    return [p for p in re.split(r"[\\/]", path)]
+
+
+def _is_inside_project(abs_path):
+    """True when the path sits under 3212-PRODUCTION or 3212-PREPRODUCTION (reachable from the farm)."""
+    upper = [p.upper() for p in _split_path(abs_path)]
+    return any(anchor in upper for anchor in PROJECT_ROOT_ANCHORS)
+
+
+def _fallback_texture_candidates():
+    """Fallback JPG locations, most specific first: next to this file's project root, then the pipeline drive."""
+    candidates = []
+    fp = bpy.data.filepath
+    if fp:
+        parts = _split_path(fp)
+        upper = [p.upper() for p in parts]
+        for anchor in PROJECT_ROOT_ANCHORS:
+            if anchor in upper:
+                sep = "\\" if "\\" in fp else "/"
+                candidates.append(sep.join(parts[:upper.index(anchor)] + list(FALLBACK_TEXTURE_PARTS)))
+                break
+    drive = "S:"
+    bridge = get_os_bridge()
+    if bridge and hasattr(bridge, "get_win_config"):
+        try:
+            drive = bridge.get_win_config(bpy.context)
+        except Exception:
+            pass
+    candidates.append(drive + "\\" + "\\".join(FALLBACK_TEXTURE_PARTS))
+    return candidates
+
+
+def _find_fallback_texture():
+    for path in _fallback_texture_candidates():
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _image_abs_path(img):
+    return os.path.normpath(bpy.path.abspath(img.filepath, library=img.library))
+
+
+def _image_file_exists(img, abs_path):
+    """UDIM/UVTILE images count as present when at least one of their tiles exists."""
+    if "<UDIM>" in abs_path or "<UVTILE>" in abs_path:
+        numbers = [t.number for t in img.tiles] if img.source == 'TILED' else []
+        for n in numbers or [1001]:
+            u, v = (n - 1001) % 10 + 1, (n - 1001) // 10 + 1
+            tile_path = abs_path.replace("<UDIM>", str(n)).replace("<UVTILE>", f"u{u}_v{v}")
+            if os.path.exists(tile_path):
+                return True
+        return False
+    return os.path.exists(abs_path)
+
+
+def _library_label(id_block):
+    lib = getattr(id_block, "library", None)
+    return lib.filepath if lib else "this file"
+
+
+def _collect_missing_images():
+    """[(image, abs_path)] for used, unpacked, file-backed images whose file is not on disk."""
+    missing = []
+    for img in bpy.data.images:
+        if img.source not in _IMAGE_FILE_SOURCES or not img.filepath:
+            continue
+        if img.packed_file or getattr(img, "packed_files", None):
+            continue
+        if img.users == 0 or img.name == FALLBACK_TEXTURE_NAME:
+            continue
+        abs_path = _image_abs_path(img)
+        if not _image_file_exists(img, abs_path):
+            missing.append((img, abs_path))
+    return missing
+
+
+def _farm_report(lines):
+    print("\n".join(lines), flush=True)
+
+
+def _farm_abort(title, entries):
+    """
+    Prints a readable block (Deadline's Blender plugin fails a task on lines starting "Error:")
+    and, on a background farm task, ends Blender with a non-zero exit code. A RuntimeError from a
+    render handler is only printed by Blender and the render carries on, so SystemExit is required.
+    """
+    lines = ["", "=" * 60, f"Error: [bRender] {title}"]
+    for entry in entries:
+        lines.append(f"Error: [bRender]   {entry}")
+    lines.append("=" * 60)
+    _farm_report(lines)
+    if bpy.app.background:
+        raise SystemExit(FARM_ABORT_EXIT_CODE)
+
+
+@persistent
+def fallback_missing_textures(scene, *args):
+    """render_init: point missing image files at the network fallback texture before the render starts."""
+    if not _is_brender_render_file():
+        return
+    missing = _collect_missing_images()
+    if not missing:
+        print("[bRender] Texture check: every image file was found.", flush=True)
+        return
+
+    print(f"[bRender] Texture check: {len(missing)} image file(s) missing.", flush=True)
+    fallback = _find_fallback_texture()
+    if not fallback:
+        _farm_abort(
+            "Missing textures and the fallback texture is not reachable either. Render stopped.",
+            [f"tried fallback: {p}" for p in _fallback_texture_candidates()]
+            + [f"missing: '{img.name}' -> {path} (from {_library_label(img)})" for img, path in missing],
+        )
+        return
+
+    failed = []
+    for img, path in missing:
+        try:
+            if img.source == 'TILED':
+                img.source = 'FILE'
+            img.filepath = fallback
+            img.reload()
+            print(f"[bRender] FALLBACK TEXTURE: '{img.name}' from {_library_label(img)} "
+                  f"was {path}", flush=True)
+        except Exception as e:
+            failed.append(f"'{img.name}' -> {path} (from {_library_label(img)}): {e}")
+
+    if failed:
+        _farm_abort("These missing textures could not be redirected. Fix the source assets:", failed)
+
+
+def _collect_presubmit_problems():
+    """
+    Checks the open file for things that break or degrade a Deadline render.
+    Returns [(kind, name, path, source)]; kind is one of
+    'MISSING_LIBRARY', 'DUPLICATE_COPY', 'MISSING_TEXTURE', 'LOCAL_PATH'.
+    """
+    problems = []
+    for lib in bpy.data.libraries:
+        abs_path = os.path.normpath(bpy.path.abspath(lib.filepath, library=lib.parent))
+        source = lib.parent.filepath if lib.parent else "this file"
+        if not os.path.exists(abs_path):
+            problems.append(('MISSING_LIBRARY', lib.name, abs_path, source))
+        elif not _is_inside_project(abs_path):
+            problems.append(('LOCAL_PATH', lib.name, abs_path, source))
+        if re.search(r" \(\d+\)\.blend$", abs_path, re.IGNORECASE):
+            problems.append(('DUPLICATE_COPY', lib.name, abs_path, source))
+
+    missing = {img.name for img, _ in _collect_missing_images()}
+    for img in bpy.data.images:
+        if img.source not in _IMAGE_FILE_SOURCES or not img.filepath or img.users == 0:
+            continue
+        if img.packed_file or getattr(img, "packed_files", None):
+            continue
+        abs_path = _image_abs_path(img)
+        if img.name in missing:
+            problems.append(('MISSING_TEXTURE', img.name, abs_path, _library_label(img)))
+        elif not _is_inside_project(abs_path):
+            problems.append(('LOCAL_PATH', img.name, abs_path, _library_label(img)))
+    return problems
+
+
+PRESUBMIT_LABELS = {
+    'MISSING_LIBRARY': "Missing linked file",
+    'DUPLICATE_COPY': "Linked to a ' (1)' copy",
+    'MISSING_TEXTURE': "Missing texture",
+    'LOCAL_PATH': "Outside the project (farm can't reach it)",
+}
+
+
+def _format_presubmit_problem(problem):
+    kind, name, path, source = problem
+    return f"{PRESUBMIT_LABELS[kind]}: '{name}' -> {path} (from {source})"
+
+
+def _show_presubmit_popup(context, problems, title):
+    if bpy.app.background or not getattr(context, "window_manager", None):
+        return
+
+    def draw(self, _context):
+        col = self.layout.column(align=True)
+        for problem in problems[:25]:
+            kind, name, path, source = problem
+            col.label(text=f"{PRESUBMIT_LABELS[kind]}: {name}", icon='ERROR')
+            col.label(text=f"      {path}")
+        if len(problems) > 25:
+            col.label(text=f"... and {len(problems) - 25} more (full list in the console).")
+
+    context.window_manager.popup_menu(draw, title=title, icon='ERROR')
+
+
+class BRENDER_OT_check_farm_files(bpy.types.Operator):
+    """List linked files and textures the render farm will not find"""
+    bl_idname = "brender.check_farm_files"
+    bl_label = "Check Files for Farm"
+
+    def execute(self, context):
+        problems = _collect_presubmit_problems()
+        if not problems:
+            self.report({'INFO'}, "Farm check: all linked files and textures found.")
+            return {'FINISHED'}
+        for problem in problems:
+            log.warning(f"[Farm check] {_format_presubmit_problem(problem)}")
+        _show_presubmit_popup(context, problems, f"Farm check: {len(problems)} problem(s)")
+        self.report({'WARNING'}, f"Farm check: {len(problems)} problem(s), see the list or the console.")
+        return {'FINISHED'}
+
+
 
 def attach_project_logger(target_directory):
     """
@@ -128,73 +492,98 @@ def get_current_user(context):
         
     return re.sub(r'[^a-zA-Z0-9_-]', '_', user_name)
 
-# --- GOOGLE SHEETS HELPER (ROBUST) ---
-def _send_payload_thread(urls, payload):
-    """
-    Worker function to send data to Google Sheets.
-    Uses standard library urllib for zero-dependency compatibility.
-    """
-    import json
-    import urllib.request
-    import urllib.error
-    import time
+# --- GOOGLE SHEETS NOTIFICATION (5.1.9) ---
+# "Send to render" tells the sheet "sent to render" only AFTER deadlinecommand created the job
+# (see _submit_to_deadline_thread). Until 5.1.8 the post went out first and the Deadline result
+# was only logged: on 30 Sep - 2 Oct 2026 tan_rub's Deadline client could not reach the
+# repository, every submit failed, and 16 shots read "sent to render / render: queued" for a
+# week with no job behind them (sheets TIMELINE B35).
+SHEET_POST_TIMEOUT_S = 30      # the web app regularly needs more than 10 s
+SHEET_POST_RETRY_DELAY_S = 2
 
+
+def _is_timeout_error(exc):
+    import socket
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        return True
+    return "timed out" in str(exc).lower()
+
+
+def _post_sheet_notification(urls, payload, timeout=None):
+    """
+    POSTs payload to every URL. Touches no bpy data, so it is safe in a worker thread.
+    A timed-out post is NOT retried: the web app normally finishes the write after the client
+    gave up, and the old retry produced the duplicate bRender rows in the sheet's logs tab.
+    A refused or failed post is retried once. Returns {url: 'ok' | 'timeout' | 'error: ...'}.
+    """
+    timeout = SHEET_POST_TIMEOUT_S if timeout is None else timeout
     data = json.dumps(payload).encode('utf-8')
     headers = {
         'Content-Type': 'application/json',
         'User-Agent': 'Blender-bRender-Client'
     }
-
+    results = {}
     for url in urls:
-        max_retries = 2
-        base_delay = 1 
-        
-        for attempt in range(1, max_retries + 1):
+        for attempt in (1, 2):
             try:
                 req = urllib.request.Request(url, data=data, headers=headers, method='POST')
-                log.info(f"Uploading to Sheets: {url} (Attempt {attempt}/{max_retries})...")
-                
-                with BrenderTimer(f"Sheets Upload Request (Attempt {attempt})"):
-                    with urllib.request.urlopen(req, timeout=10) as response:
-                        result = response.read().decode('utf-8')
-                        log.info(f"Google Sheet Response: {result}")
-                break # Success! Move to next URL.
-                    
+                log.info(f"Notifying sheet: {url} (attempt {attempt}/2, timeout {timeout} s)...")
+                with BrenderTimer(f"Sheets notification (attempt {attempt})"):
+                    with urllib.request.urlopen(req, timeout=timeout) as response:
+                        log.info(f"Google Sheet Response: {response.read().decode('utf-8')}")
+                results[url] = 'ok'
+                break
             except Exception as e:
-                log.error(f"Error during Sheets upload to {url}: {e}")
-            
-            if attempt < max_retries:
-                time.sleep(base_delay)
+                if _is_timeout_error(e):
+                    log.warning(f"Sheet notification to {url} timed out after {timeout} s; not retried "
+                                f"(the web app usually completes the write anyway).")
+                    results[url] = 'timeout'
+                    break
+                log.error(f"Sheet notification to {url} failed: {e}")
+                results[url] = f"error: {e}"
+                if attempt == 1:
+                    time.sleep(SHEET_POST_RETRY_DELAY_S)
+    return results
 
-def upload_shot_data(context, shot_name, filename, version_str):
-    """
-    Prepares data (Filename, Version, User) and starts separate parallel upload threads for each URL.
-    """
+
+def build_sheet_notification(context, filename, version_str, extra=None):
+    """Main thread only (reads add-on preferences). Returns (urls, payload) or (None, None)."""
     prefs = get_prefs(context)
     if not prefs:
-        return
+        return None, None
 
     url_preprod = prefs.google_webapp_url.strip() if prefs.google_webapp_url else ""
     url_prod = "https://script.google.com/macros/s/KRUTART_REDACTED_APPS_SCRIPT_ID_1/exec"
-    
-    urls = [u for u in [url_preprod, url_prod] if u and u.startswith("http")]
-    
-    if not urls:
-        log.warning("No valid Google WebApp URLs set. Skipping upload.")
-        return
 
-    user_name = get_current_user(context)
-    filename_no_ext = os.path.splitext(filename)[0]
+    urls = [u for u in [url_preprod, url_prod] if u and u.startswith("http")]
+    if not urls:
+        log.warning("No valid Google WebApp URLs set. Skipping the sheet notification.")
+        return None, None
 
     payload = {
-        "filename": filename_no_ext,
+        "filename": os.path.splitext(filename)[0],
         "version": version_str,
-        "user": user_name
+        "user": get_current_user(context),
     }
+    if extra:
+        payload.update(extra)
+    return urls, payload
 
-    for url in urls:
-        t = threading.Thread(target=_send_payload_thread, args=([url], payload))
-        t.start()
+
+def upload_shot_data(context, shot_name, filename, version_str):
+    """
+    Immediate notification without a Deadline job. Kept for the debug "Test Connection" button
+    and for "Prepare Active Shot" (registered, not drawn in any panel). "Send to render" uses the
+    post-submit path in _submit_to_deadline_thread instead.
+    """
+    urls, payload = build_sheet_notification(context, filename, version_str)
+    if not urls:
+        return
+    t = threading.Thread(target=_post_sheet_notification, args=(urls, payload))
+    t.start()
 
 
 
@@ -515,6 +904,32 @@ def _perform_destructive_save(context, new_filepath, source_scene_name, output_f
             except Exception as e:
                 log.error(f"Failed to restore scenes after save: {e}")
 
+# --- Burn-in layout (5.1.10) ---
+# The green guide (corner of the layout render: shot name + timecode) sat on top of the white stamp block (Boza,
+# 6 Oct 2026), and the filename line (5.1.8) makes the block one line taller. Measured on the sc08-sh040 render
+# (4096 px, stamp font 32): stamp lines start 6 px from the top with a 39 px pitch and 26 px glyphs; the guide's
+# text starts 16.5 px x mult below the old guide position. The guide now moves down just enough to clear the block.
+STAMP_TOP_F, STAMP_PITCH_F, STAMP_GLYPH_F, STAMP_MARGIN_F = 6 / 32, 39 / 32, 26 / 32, 0.6   # x stamp font size
+GUIDE_TEXT_TOP_PER_MULT = 16.5
+_STAMP_TOP_LEFT = ("use_stamp_filename", "use_stamp_date", "use_stamp_render_time",
+                   "use_stamp_memory", "use_stamp_hostname", "use_stamp_note")
+
+
+def _guide_shift_below_stamp(scene, mult):
+    """Canvas pixels to move the guide down so its text starts below the top-left stamp lines (0 when no stamp)."""
+    r = scene.render
+    if not r.use_stamp:
+        return 0.0
+    lines = sum(1 for k in _STAMP_TOP_LEFT if getattr(r, k, False))
+    if not lines:
+        return 0.0
+    f = r.stamp_font_size
+    pct = max(r.resolution_percentage, 1) / 100.0
+    block_bottom = (STAMP_TOP_F + (lines - 1) * STAMP_PITCH_F + STAMP_GLYPH_F + STAMP_MARGIN_F) * f
+    text_top = GUIDE_TEXT_TOP_PER_MULT * mult * pct
+    return max(0.0, block_bottom - text_top) / pct
+
+
 def apply_brender_optimizations(target_scene, use_simplify):
     """Applies general background configurations to the scene for the farm."""
     render = target_scene.render
@@ -549,7 +964,7 @@ def apply_brender_optimizations(target_scene, use_simplify):
     render.use_stamp_camera = False
     render.use_stamp_lens = False
     render.use_stamp_marker = False
-    render.use_stamp_filename = False
+    render.use_stamp_filename = True
     render.use_stamp_note = False
     
     max_res = max(render.resolution_x, render.resolution_y)
@@ -782,7 +1197,7 @@ def _prepare_shot_in_current_file_impl(context, shot_marker):
             new_video.transform.scale_x = 3 * mult_x
             new_video.transform.scale_y = 3 * mult_x
             new_video.transform.offset_x = 410 * mult_x
-            new_video.transform.offset_y = 1708 * mult_y
+            new_video.transform.offset_y = 1708 * mult_y - _guide_shift_below_stamp(target_scene, mult_y)
 
             new_video.crop.max_x = 860
             new_video.crop.max_y = 498
@@ -1096,8 +1511,98 @@ def _purge_orphans():
 
 # --- DEADLINE SUBMISSION HELPER ---
 # --- DEADLINE SUBMISSION HELPER ---
-def _submit_to_deadline(context, filepath, start_frame, end_frame, output_path, deadline_cmd):
-    """Submits a specific blend file to Deadline asynchronously using a background thread."""
+# --- SUBMISSION RESULTS (5.1.9) ---
+# The Deadline call runs in a worker thread (a batch must not freeze Blender), so its result is
+# handed to the main thread through this state. A timer (_brender_submit_watch) turns failures
+# into a popup and a red box in the bRender panel; nothing else in the UI depended on the result.
+_SUBMIT_LOCK = threading.Lock()
+_SUBMIT_STATE = {"pending": 0, "events": [], "failures": [], "succeeded": 0}
+
+
+def _record_submit_event(kind, job_name, reason="", job_id=""):
+    """Worker thread: one event per submission, and the pending count drops in the same step."""
+    with _SUBMIT_LOCK:
+        _SUBMIT_STATE["events"].append({
+            "kind": kind, "job": job_name, "reason": reason, "job_id": job_id,
+            "time": time.strftime("%H:%M:%S"),
+        })
+        _SUBMIT_STATE["pending"] = max(0, _SUBMIT_STATE["pending"] - 1)
+
+
+def _deadline_failure_reason(stdout, stderr, returncode):
+    """The line an artist can act on: the first 'Error...' line, else the last line of output."""
+    text = "\n".join([stdout or "", stderr or ""])
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("error"):
+            return stripped[:220]
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    return lines[-1][:220] if lines else f"deadlinecommand exit code {returncode}"
+
+
+def _parse_job_id(stdout):
+    m = re.search(r'^\s*JobID=(\S+)', stdout or "", re.MULTILINE)
+    return m.group(1) if m else ""
+
+
+def _tag_brender_redraw():
+    try:
+        for win in bpy.context.window_manager.windows:
+            for area in win.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+    except Exception:
+        pass
+
+
+def _show_submit_failure_popup(failures):
+    if bpy.app.background:
+        return
+    wm = getattr(bpy.context, "window_manager", None)
+    win = wm.windows[0] if wm and wm.windows else None
+    if not win:
+        return
+
+    def draw(self, _context):
+        col = self.layout.column(align=True)
+        for f in failures[:10]:
+            col.label(text=f["job"], icon='ERROR')
+            col.label(text=f"      {f['reason']}")
+        col.separator()
+        col.label(text="Nothing reached the render farm and the sheet was NOT updated.")
+        col.label(text="Fix the cause (usually the Deadline connection) and send again.")
+
+    try:
+        with bpy.context.temp_override(window=win):
+            wm.popup_menu(draw, title=f"bRender: {len(failures)} Deadline submission(s) FAILED", icon='ERROR')
+    except Exception as e:
+        log.warning(f"Could not show the failure popup ({e}); the bRender panel lists the failure.")
+
+
+def _brender_submit_watch():
+    """Main-thread timer: drain submission events, keep failures for the panel, show the popup."""
+    with _SUBMIT_LOCK:
+        events = _SUBMIT_STATE["events"]
+        _SUBMIT_STATE["events"] = []
+        pending = _SUBMIT_STATE["pending"]
+        new_failures = [e for e in events if e["kind"] == "fail"]
+        _SUBMIT_STATE["failures"].extend(new_failures)
+        _SUBMIT_STATE["succeeded"] += sum(1 for e in events if e["kind"] == "ok")
+    if events:
+        _tag_brender_redraw()
+    if new_failures:
+        _show_submit_failure_popup(new_failures)
+    return 1.0 if pending > 0 else None
+
+
+def _ensure_submit_watch():
+    if not bpy.app.timers.is_registered(_brender_submit_watch):
+        bpy.app.timers.register(_brender_submit_watch, first_interval=1.0)
+
+
+def _submit_to_deadline(context, filepath, start_frame, end_frame, output_path, deadline_cmd, notify=None):
+    """Submits a specific blend file to Deadline asynchronously using a background thread.
+    notify = (urls, payload) from build_sheet_notification: posted only after Deadline accepted the job."""
     priority = context.scene.brender_deadline_priority
     pool = context.scene.brender_deadline_pool
     sec_pool = context.scene.brender_deadline_secondary_pool
@@ -1120,61 +1625,66 @@ def _submit_to_deadline(context, filepath, start_frame, end_frame, output_path, 
     major, minor = bpy.app.version[0], bpy.app.version[1]
     blender_version = f"{major}.{minor}"
 
+    with _SUBMIT_LOCK:
+        _SUBMIT_STATE["pending"] += 1
     t = threading.Thread(
         target=_submit_to_deadline_thread,
-        args=(sanitized_filepath, start_frame, end_frame, sanitized_output_path, deadline_cmd, priority, pool, sec_pool, group, blender_version)
+        args=(sanitized_filepath, start_frame, end_frame, sanitized_output_path, deadline_cmd, priority, pool, sec_pool, group, blender_version, notify)
     )
     t.start()
+    _ensure_submit_watch()
     return True
 
-def _submit_to_deadline_thread(filepath, start_frame, end_frame, output_path, deadline_cmd, priority, pool, sec_pool, group, blender_version):
-    with BrenderTimer(f"Deadline Submission - {os.path.basename(filepath)}"):
-        if not os.path.exists(deadline_cmd):
-            log.error(f"Deadline executable not found at: {deadline_cmd}")
-            return
+def _submit_to_deadline_thread(filepath, start_frame, end_frame, output_path, deadline_cmd, priority, pool, sec_pool, group, blender_version, notify=None):
+    job_name = os.path.basename(filepath)
+    outcome = {"kind": "fail", "reason": "submission did not complete", "job_id": ""}
+    try:
+        with BrenderTimer(f"Deadline Submission - {job_name}"):
+            if not os.path.exists(deadline_cmd):
+                outcome["reason"] = f"deadlinecommand not found at: {deadline_cmd}"
+                log.error(f"Deadline executable not found at: {deadline_cmd}")
+                return
 
-        job_name = os.path.basename(filepath)
-        batch_name = job_name
-        
-        total_frames = (end_frame - start_frame) + 1
-        chunk_size = total_frames + 5000 
+            batch_name = job_name
 
-        job_info = [
-            f"Name={job_name}",
-            f"BatchName={batch_name}",
-            "Plugin=Blender",
-            f"Frames={start_frame}-{end_frame}",
-            f"ChunkSize={chunk_size}",
-            f"Priority={priority}",
-            f"Pool={pool}",
-            f"SecondaryPool={sec_pool}",
-            f"Group={group}",
-            f"OutputDirectory0={os.path.dirname(output_path)}",
-            f"OutputFilename0={os.path.basename(output_path)}", 
-        ]
+            total_frames = (end_frame - start_frame) + 1
+            chunk_size = total_frames + 5000
 
-        plugin_info = [
-            f"SceneFile={filepath}",
-            f"Version={blender_version}",
-            "Build=None",
-            "Threads=0",
-        ]
+            job_info = [
+                f"Name={job_name}",
+                f"BatchName={batch_name}",
+                "Plugin=Blender",
+                f"Frames={start_frame}-{end_frame}",
+                f"ChunkSize={chunk_size}",
+                f"Priority={priority}",
+                f"Pool={pool}",
+                f"SecondaryPool={sec_pool}",
+                f"Group={group}",
+                f"OutputDirectory0={os.path.dirname(output_path)}",
+                f"OutputFilename0={os.path.basename(output_path)}",
+            ]
 
-        log.info("--- Deadline Job Payload (Background Thread) ---")
-        for line in job_info: log.info(line)
-        log.info("----------------------------")
+            plugin_info = [
+                f"SceneFile={filepath}",
+                f"Version={blender_version}",
+                "Build=None",
+                "Threads=0",
+            ]
 
-        try:
+            log.info("--- Deadline Job Payload (Background Thread) ---")
+            for line in job_info: log.info(line)
+            log.info("----------------------------")
+
             with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".job", encoding='utf-8') as j_file:
                 j_file.write("\n".join(job_info))
                 j_job_path = j_file.name
-            
+
             with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".job", encoding='utf-8') as p_file:
                 p_file.write("\n".join(plugin_info))
                 p_plugin_path = p_file.name
 
             log.info(f"Executing deadlinecommand (Background) for {job_name}...")
-            
+
             startupinfo = None
             if sys.platform == "win32":
                 startupinfo = subprocess.STARTUPINFO()
@@ -1196,16 +1706,37 @@ def _submit_to_deadline_thread(filepath, start_frame, end_frame, output_path, de
             except:
                 pass
 
-            if process.returncode == 0:
+            if process.returncode == 0 and "Result=Failed" not in (stdout or ""):
+                job_id = _parse_job_id(stdout)
                 log.info(f"Deadline Submission Successful for {job_name}:")
-                log.info(stdout.strip())
+                log.info((stdout or "").strip())
+                if not job_id:
+                    log.warning(f"deadlinecommand returned 0 but printed no JobID= line for {job_name}.")
+                outcome.update(kind="ok", reason="", job_id=job_id)
+                # Only now does the sheet hear about it (5.1.9).
+                if notify and notify[0]:
+                    urls, payload = notify
+                    payload = dict(payload)
+                    payload["deadlineJobId"] = job_id
+                    _post_sheet_notification(urls, payload)
+                else:
+                    log.info(f"No sheet notification configured for {job_name}.")
             else:
+                outcome["reason"] = _deadline_failure_reason(stdout, stderr, process.returncode)
                 log.error(f"Deadline Submission Failed for {job_name}:")
-                log.error(f"STDOUT:\n{stdout.strip()}")
-                log.error(f"STDERR:\n{stderr.strip()}")
+                log.error(f"STDOUT:\n{(stdout or '').strip()}")
+                log.error(f"STDERR:\n{(stderr or '').strip()}")
+                log.error(f"Sheet NOT notified for {job_name}: no Deadline job exists.")
 
-        except Exception as e:
-            log.error(f"Exception during background Deadline submission for {job_name}: {e}")
+    except Exception as e:
+        outcome["reason"] = f"exception: {e}"
+        log.error(f"Exception during background Deadline submission for {job_name}: {e}")
+    finally:
+        _record_submit_event(outcome["kind"], job_name, outcome["reason"], outcome["job_id"])
+        if outcome["kind"] == "ok":
+            field(f"Deadline accepted {job_name} (JobID {outcome['job_id'] or '?'}); sheet notified: {bool(notify and notify[0])}")
+        else:
+            log.error(f"Deadline submission FAILED for {job_name}: {outcome['reason']} (sheet not notified)")
 
 # --- DATA STRUCTURE FOR SHOT LIST ---
 class BRENDER_ShotListItem(bpy.types.PropertyGroup):
@@ -1285,6 +1816,25 @@ class BRENDER_OT_select_all_shots(bpy.types.Operator):
             shot.is_selected = (self.action == 'SELECT')
         return {'FINISHED'}
 
+def _lifeguard_may_write(filepath=None):
+    """
+    The overwrite shield redirects a guest's save to a __CONFLICT file, and a save handler cannot make the
+    calling operator fail - so ask first. Asks Krutart Overwrite Shield directly (the copy that is active,
+    then the module by name), then the retired Lifeguard shim, which forwards to it. (True, "") when none is
+    loaded or the check fails (fail open, as before).
+    """
+    for name in (getattr(sys, "_krutart_overwrite_shield_active", None), "krutart-overwrite_shield", "krutart-lifeguard"):
+        mod = sys.modules.get(name) if name else None
+        check = getattr(mod, "may_write", None)
+        if callable(check):
+            try:
+                return check(filepath)
+            except Exception as e:
+                log.warning(f"Overwrite shield check failed open ({name}): {e!r}")
+                return True, ""
+    return True, ""
+
+
 class BRENDER_OT_prepare_this_file(bpy.types.Operator):
     bl_idname = "brender.prepare_this_file"
     bl_label = "Prepare This File"
@@ -1297,6 +1847,11 @@ class BRENDER_OT_prepare_this_file(bpy.types.Operator):
         return bool(filepath)
 
     def execute(self, context):
+        ok, reason = _lifeguard_may_write()
+        if not ok:
+            self.report({'ERROR'}, f"Lifeguard: {reason}")
+            return {'CANCELLED'}
+
         filepath = bpy.data.filepath
         filename = os.path.basename(filepath)
 
@@ -1451,6 +2006,29 @@ class BRENDER_OT_prepare_render_batch(bpy.types.Operator):
                 self.report({"WARNING"}, "No shots selected from the list.")
                 return {"CANCELLED"}
 
+            # Phase gate (5.1.9): production renders take their phase from the dashboard, read
+            # again right now. A failed read or an unresolved phase blocks the send unless the
+            # artist ticked "Manual phase". 5 Oct 2026: a render labelled "blocking" reopened the
+            # finished BLK phase of sc12-funeral-sh040 (TIMELINE B35).
+            phase_extra = {}
+            if _is_production(context):
+                phase, phase_source, phase_error = resolve_render_phase(context, refetch=True)
+                if phase_error:
+                    log.error(f"[Phase] Send to render blocked: {phase_error}")
+                    self.report({'ERROR'}, phase_error)
+                    return {"CANCELLED"}
+                phase_extra = {"phase": phase, "phase_source": phase_source}
+                field(f"[Phase] Send to render as '{phase}' (source: {phase_source}) for {os.path.basename(bpy.data.filepath)}, "
+                      f"{len(selected_shot_names)} shot(s)")
+
+            with _SUBMIT_LOCK:
+                _SUBMIT_STATE["failures"] = []
+
+            # Pre-submit farm check (warning only, never blocks the batch)
+            farm_problems = _collect_presubmit_problems()
+            for problem in farm_problems:
+                log.warning(f"[Farm check] {_format_presubmit_problem(problem)}")
+
             total_timer = BrenderTimer("Batch Prepare Render")
             total_timer.start()
 
@@ -1501,15 +2079,18 @@ class BRENDER_OT_prepare_render_batch(bpy.types.Operator):
                         context.scene.brender_output_format
                     )
                     
-                    upload_shot_data(
-                        context, 
-                        shot_name=shot_name, 
+                    # The sheet is notified by the Deadline thread, after the job exists (5.1.9).
+                    notify = build_sheet_notification(
+                        context,
                         filename=os.path.basename(new_filepath),
-                        version_str=version_str_out
+                        version_str=version_str_out,
+                        extra=phase_extra,
                     )
-
-                    submit_success = _submit_to_deadline(context, new_filepath, start_frame, end_frame, output_path, deadline_cmd)
-                    if submit_success:
+                    submit_started = _submit_to_deadline(
+                        context, new_filepath, start_frame, end_frame, output_path, deadline_cmd,
+                        notify=notify if notify[0] else None,
+                    )
+                    if submit_started:
                         submitted_count += 1
 
                     processed_count += 1
@@ -1547,9 +2128,15 @@ class BRENDER_OT_prepare_render_batch(bpy.types.Operator):
             else:
                 log.info(f"[Perf] Batch Summary: Total Elapsed: {total_timer.elapsed:.4f}s | No shots processed.")
 
-            msg = f"Batch complete. Saved {processed_count} files. Submitted {submitted_count} to Deadline."
+            msg = (f"Batch complete. Saved {processed_count} files, sending {submitted_count} to Deadline. "
+                   f"Each shot reaches the sheet only once Deadline accepts it; failures pop up.")
             log.info(f"--- {msg} ---")
-            self.report({'INFO'}, msg)
+            if farm_problems:
+                self.report({'WARNING'}, f"{msg} Farm check: {len(farm_problems)} problem(s), see the list.")
+                _show_presubmit_popup(context, farm_problems,
+                                      f"Sent, but the farm may fail: {len(farm_problems)} problem(s)")
+            else:
+                self.report({'INFO'}, msg)
 
             return {'FINISHED'}
         finally:
@@ -1557,6 +2144,19 @@ class BRENDER_OT_prepare_render_batch(bpy.types.Operator):
                 if auto_refresh_shot_list not in bpy.app.handlers.depsgraph_update_post:
                     bpy.app.handlers.depsgraph_update_post.append(auto_refresh_shot_list)
                 log.info("Re-enabled auto_refresh_shot_list handler after batch preparation.")
+
+class BRENDER_OT_clear_submit_failures(bpy.types.Operator):
+    """Hide the list of failed Deadline submissions (they stay in the console log)"""
+    bl_idname = "brender.clear_submit_failures"
+    bl_label = "Dismiss"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        with _SUBMIT_LOCK:
+            _SUBMIT_STATE["failures"] = []
+        _tag_brender_redraw()
+        return {'FINISHED'}
+
 
 # --- HANDLERS (AUTO-REFRESH) ---
 @persistent
@@ -1607,20 +2207,43 @@ class VIEW3D_PT_brender_panel(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
         
-        box = layout.box()
+        with _SUBMIT_LOCK:
+            failures = list(_SUBMIT_STATE["failures"])
+            pending = _SUBMIT_STATE["pending"]
+        if failures:
+            fail_box = layout.box()
+            fail_box.alert = True
+            head = fail_box.row()
+            head.label(text=f"{len(failures)} submission(s) FAILED: not on the farm, sheet not updated", icon='ERROR')
+            head.operator(BRENDER_OT_clear_submit_failures.bl_idname, text="", icon='X')
+            for f in failures[-5:]:
+                fail_box.label(text=f"{f['time']}  {f['job']}")
+                fail_box.label(text=f"      {f['reason']}")
 
-        # --- NEW: Phase Toggle for Production ---
+        box = layout.box()
+        if pending:
+            box.label(text=f"Submitting {pending} job(s) to Deadline...", icon='TIME')
+
+        # --- Phase for Production (5.1.9: read-only, from the dashboard) ---
         if _is_production(context):
             dash_row = box.row(align=True)
             dash_row.label(text=f"DAB: {DASH_FETCH_STATUS}", icon='URL')
             dash_row.operator("brender.refresh_dash", icon='FILE_REFRESH', text="")
 
-            # Phase toggle: all six phases in a 2-column x 3-row grid.
+            # Six phases in a 2-column x 3-row grid. Shows what the dashboard says; only
+            # editable with "Manual phase", which is logged with the render.
             phase_grid = box.column(align=True)
+            phase_grid.enabled = bool(scene.brender_phase_manual)
             for _i in range(0, len(PHASE_ITEMS), 2):
                 phase_row = phase_grid.row(align=True)
                 for _phase_id, _phase_name, _phase_desc in PHASE_ITEMS[_i:_i + 2]:
                     phase_row.prop_enum(scene, 'brender_render_phase', _phase_id, text=_phase_name)
+            manual_row = box.row()
+            manual_row.prop(scene, "brender_phase_manual")
+            if scene.brender_phase_manual:
+                warn = box.row()
+                warn.alert = True
+                warn.label(text="Manual phase: the dashboard is not checked.", icon='ERROR')
             box.separator()
 
         row = box.row(align=True)
@@ -1656,6 +2279,7 @@ class VIEW3D_PT_brender_panel(bpy.types.Panel):
                 icon="EXPORT", 
                 text="Send to render"
             )
+            box.operator(BRENDER_OT_check_farm_files.bl_idname, icon="VIEWZOOM")
 
         else:
             box.label(text="No shots found. Refresh or check markers.", icon="INFO")
@@ -2168,8 +2792,10 @@ classes = (
     BRENDER_OT_select_all_shots, 
     BRENDER_OT_prepare_active_shot,
     BRENDER_OT_prepare_this_file,
+    BRENDER_OT_clear_submit_failures,
     BRENDER_OT_refresh_shot_list,
     BRENDER_OT_prepare_render_batch,
+    BRENDER_OT_check_farm_files,
     VIEW3D_PT_brender_panel,
     BRENDER_OT_debug_set_shot,
     BRENDER_OT_debug_step_1_create_scene,
@@ -2191,6 +2817,8 @@ DAB_CSV_URL = f"https://docs.google.com/spreadsheets/d/{DAB_SPREADSHEET_ID}/expo
 
 CACHED_DASH_DATA = {}
 DASH_FETCH_STATUS = "Ready"
+DAB_FETCH_TIMEOUT_LOAD_S = 10   # file open: keep it short
+DAB_FETCH_TIMEOUT_SEND_S = 30   # Send to render: rare, and a wrong phase costs a render
 
 DAB_PHASE_ORDER = ['BLK', 'FCM', 'ANI', 'STD', 'VFX', 'LGT']
 DAB_TAG_TO_PHASE = {
@@ -2216,11 +2844,12 @@ PHASE_ITEMS = [
 
 class GoogleCSVClient:
     @staticmethod
-    def fetch_dash_data():
+    def fetch_dash_data(timeout=None):
         global CACHED_DASH_DATA, DASH_FETCH_STATUS
+        timeout = DAB_FETCH_TIMEOUT_LOAD_S if timeout is None else timeout
         try:
             log.info(f"Fetching DAB Dashboard from: {DAB_CSV_URL}")
-            response = urllib.request.urlopen(DAB_CSV_URL, timeout=10)
+            response = urllib.request.urlopen(DAB_CSV_URL, timeout=timeout)
             data = response.read().decode('utf-8')
             # The DAB sheet has banner rows (title + VR-group) above the real
             # header row. Locate the header row containing 'SHOT ID' so the
@@ -2302,9 +2931,49 @@ def get_active_phase_for_shot(shot_id):
     return DAB_TAG_TO_PHASE[highest_tag].lower()
 
 
+def resolve_render_phase(context, refetch=True):
+    """
+    Phase for a production render (5.1.9). Returns (phase, source, error):
+      - "Manual phase" ticked: the scene's phase, source "manual" (logged loudly);
+      - otherwise the dashboard, read again when refetch=True: the latest phase in progress
+        for this file's shot, written to every scene, source "dab";
+      - no dashboard or no phase in progress: (None, None, message). There is no silent
+        fallback to whatever phase the file was saved with.
+    """
+    scene = context.scene
+    if getattr(scene, "brender_phase_manual", False):
+        phase = scene.brender_render_phase
+        log.warning(f"[Phase] MANUAL phase '{phase}' chosen by the artist; the dashboard was not consulted.")
+        return phase, "manual", None
+    if refetch:
+        ok = GoogleCSVClient.fetch_dash_data(timeout=DAB_FETCH_TIMEOUT_SEND_S)
+    else:
+        ok = DASH_FETCH_STATUS == "Synced" and bool(CACHED_DASH_DATA)
+    if not ok:
+        return None, None, (f"Phase unknown: the dashboard could not be read ({DASH_FETCH_STATUS}). "
+                            f"Refresh DAB, or tick 'Manual phase'.")
+    phase = get_active_phase_for_shot(bpy.data.filepath)
+    if not phase:
+        return None, None, ("The dashboard shows no phase in progress for this shot. "
+                            "If this render is deliberate, tick 'Manual phase'.")
+    for sc in bpy.data.scenes:
+        try:
+            sc.brender_render_phase = phase
+        except Exception as e:
+            log.warning(f"Could not set the render phase '{phase}' on scene '{sc.name}': {e}")
+    return phase, "dab", None
+
+
 @persistent
 def auto_switch_phase_on_load(dummy):
     """Triggered on file load to sync the render phase with the DAB dashboard."""
+    # "Manual phase" never outlives the session it was ticked in (5.1.9).
+    for scene in bpy.data.scenes:
+        try:
+            if getattr(scene, "brender_phase_manual", False):
+                scene.brender_phase_manual = False
+        except Exception:
+            pass
     GoogleCSVClient.fetch_dash_data()
     active_phase = get_active_phase_for_shot(bpy.data.filepath)
     if active_phase:
@@ -2346,6 +3015,8 @@ def get_render_phase_items(self, context):
     return PHASE_ITEMS
 
 def register():
+    _field_log_attach(bl_info["version"])
+    _field_wrap_operators(list(classes) + [BRENDER_OT_refresh_dash])
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.utils.register_class(BRENDER_OT_refresh_dash)
@@ -2379,7 +3050,14 @@ def register():
     bpy.types.Scene.brender_render_phase = bpy.props.EnumProperty(
         name="Phase",
         items=get_render_phase_items,
-        description="Select the production phase for this render",
+        description="Production phase of this render, taken from the dashboard",
+    )
+
+    bpy.types.Scene.brender_phase_manual = bpy.props.BoolProperty(
+        name="Manual phase",
+        description=("Choose the phase by hand instead of from the dashboard. Only for deliberate "
+                     "exceptions; the choice is logged with the render and resets when a file is opened"),
+        default=False,
     )
 
     bpy.types.Scene.brender_debug_shot_name = bpy.props.StringProperty()
@@ -2393,8 +3071,12 @@ def register():
 
     if auto_switch_phase_on_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(auto_switch_phase_on_load)
+
+    if fallback_missing_textures not in bpy.app.handlers.render_init:
+        bpy.app.handlers.render_init.append(fallback_missing_textures)
         
     log.info("bRender addon registered successfully.")
+    field(f"session start: bRender {'.'.join(map(str, bl_info['version']))} registered")
 
 def unregister():
     if auto_refresh_shot_list in bpy.app.handlers.load_post:
@@ -2408,12 +3090,19 @@ def unregister():
     if auto_switch_phase_on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(auto_switch_phase_on_load)
 
+    if fallback_missing_textures in bpy.app.handlers.render_init:
+        bpy.app.handlers.render_init.remove(fallback_missing_textures)
+
+    if bpy.app.timers.is_registered(_brender_submit_watch):
+        bpy.app.timers.unregister(_brender_submit_watch)
+
     del bpy.types.Scene.brender_deadline_pool
     del bpy.types.Scene.brender_deadline_secondary_pool
     del bpy.types.Scene.brender_deadline_group
     del bpy.types.Scene.brender_deadline_priority
     del bpy.types.Scene.brender_output_format
     del bpy.types.Scene.brender_render_phase
+    del bpy.types.Scene.brender_phase_manual
 
     del bpy.types.Scene.brender_debug_shot_name
     del bpy.types.Scene.brender_debug_status_message
@@ -2424,6 +3113,7 @@ def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     log.info("bRender addon unregistered.")
+    _field_log_detach()
 
 if __name__ == "__main__":
     register()

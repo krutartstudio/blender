@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Krutart Publisher",
     "author": "iori, Krutart, Gemini",
-    "version": (1, 9, 1),
+    "version": (1, 9, 4),
     "blender": (4, 0, 0),
     "location": "Properties > Output; Dope Sheet > Sidebar > Publisher",
     "description": "Streamlines incremental saving and hero file creation with detailed logging. Syncs identity with Configurator. Stamps version info for production pipelines.",
@@ -26,12 +26,151 @@ import threading
 import time
 from bpy.app.handlers import persistent
 
+# --- FIELD LOG (central error log, 1.9.3) ---
+# So a broken release shows up without waiting for an artist to report it. Appends to
+#   <company root>/SOFTWARE/BLENDER/ADDON_LOGS/publisher/<YYYY-MM-DD>/<host>__<user>.log
+# (Windows: S:\\3212-PREPRODUCTION\\SOFTWARE\\BLENDER\\ADDON_LOGS\\...; the folder next to the company ADDON folder,
+# found through the Configurator). What is written: every WARNING / ERROR of this add-on, every uncaught exception
+# of its operators with the traceback, and a few audit lines (session start and the key decisions).
+# One file per machine and day = a single writer, so the Drive sync never merges two writers.
+# The log can never break the add-on: any failure is swallowed after one console line per session.
+import logging as _fl_logging
+import traceback as _fl_traceback
+import socket as _fl_socket
+import getpass as _fl_getpass
+
+FIELD_LOG_ADDON = "publisher"
+FIELD_LOG_ENV = "KRUTART_ADDON_LOG_DIR"        # overrides the folder (tests)
+_FIELD_LOCK = threading.Lock()
+_FIELD_STATE = {"root": None, "warned": False, "ctx": "", "seen": {}}
+FIELD_REPEAT_WINDOW_S = 600   # the same level + message is written at most once per 10 minutes (UI redraws repeat)
+
+
+def _field_log_root():
+    env = os.environ.get(FIELD_LOG_ENV)
+    if env:
+        return env
+    if _FIELD_STATE["root"]:
+        return _FIELD_STATE["root"]
+    base = None
+    conf = sys.modules.get("krutart-configurator")
+    getter = getattr(conf, "get_company_addon_path", None)
+    if callable(getter):
+        try:
+            p = getter()
+            base = os.path.dirname(str(p).rstrip("\\/")) if p else None
+        except Exception:
+            base = None
+    if not base and sys.platform.startswith("win"):
+        base = r"S:\3212-PREPRODUCTION\SOFTWARE\BLENDER"
+    if not base or not os.path.isdir(base):
+        return None
+    _FIELD_STATE["root"] = os.path.join(base, "ADDON_LOGS")
+    return _FIELD_STATE["root"]
+
+
+def _field_log_file():
+    root = _field_log_root()
+    if not root:
+        return None
+    try:
+        user = _fl_getpass.getuser()
+    except Exception:
+        user = "unknown"
+    host = _fl_socket.gethostname().split(".")[0]
+    safe = lambda v: "".join(c if c.isalnum() or c in "-_" else "_" for c in str(v))[:40]
+    folder = os.path.join(root, FIELD_LOG_ADDON, time.strftime("%Y-%m-%d"))
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, f"{safe(host)}__{safe(user)}.log")
+
+
+class _FieldLogHandler(_fl_logging.Handler):
+    """WARNING and above, plus records logged with extra={"field": True}. Thread-safe; never raises."""
+    def emit(self, record):
+        try:
+            if record.levelno < _fl_logging.WARNING and not getattr(record, "field", False):
+                return
+            msg = record.getMessage()
+            now = time.time()
+            with _FIELD_LOCK:
+                key = (record.levelno, msg)
+                last, skipped = _FIELD_STATE["seen"].get(key, (0.0, 0))
+                if now - last < FIELD_REPEAT_WINDOW_S and not record.exc_info:
+                    _FIELD_STATE["seen"][key] = (last, skipped + 1)
+                    return
+                _FIELD_STATE["seen"][key] = (now, 0)
+            if skipped:
+                msg += f"  [repeated {skipped}x in the previous {FIELD_REPEAT_WINDOW_S // 60} min, not written]"
+            path = _field_log_file()
+            if not path:
+                return
+            line = (f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{record.levelname}\t{_FIELD_STATE['ctx']}\t"
+                    f"{msg}")
+            if record.exc_info:
+                line += "\n" + "".join(_fl_traceback.format_exception(*record.exc_info))
+            with _FIELD_LOCK:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(line.rstrip("\n") + "\n")
+        except Exception as e:
+            if not _FIELD_STATE["warned"]:
+                _FIELD_STATE["warned"] = True
+                print(f"[{FIELD_LOG_ADDON}] field log unavailable ({e!r}); continuing without it.")
+
+
+def field(msg):
+    """An audit line for the field log (also printed like any INFO line)."""
+    logger.info(msg, extra={"field": True})
+
+
+def _field_log_attach(version):
+    _FIELD_STATE["ctx"] = (f"{FIELD_LOG_ADDON} {'.'.join(map(str, version))} | Blender {bpy.app.version_string}"
+                           f"{' (background)' if bpy.app.background else ''}")
+    for h in list(logger.handlers):
+        if type(h).__name__ == "_FieldLogHandler":
+            logger.removeHandler(h)
+    logger.addHandler(_FieldLogHandler())
+
+
+def _field_log_detach():
+    for h in list(logger.handlers):
+        if type(h).__name__ == "_FieldLogHandler":
+            logger.removeHandler(h)
+
+
+def _field_wrap_operators(classes):
+    """Uncaught exceptions in our operators go to the field log with the traceback, then propagate as before."""
+    for cls in classes:
+        try:
+            if not issubclass(cls, bpy.types.Operator):
+                continue
+        except TypeError:
+            continue
+        for meth in ("execute", "invoke"):
+            orig = cls.__dict__.get(meth)
+            if orig is None or getattr(orig, "_field_wrapped", False):
+                continue
+            def make(orig=orig, name=getattr(cls, "bl_idname", cls.__name__), meth=meth):
+                def wrapped(self, context, *args, **kwargs):
+                    try:
+                        return orig(self, context, *args, **kwargs)
+                    except Exception:
+                        logger.exception(f"Operator {name}.{meth} raised")
+                        raise
+                wrapped._field_wrapped = True
+                wrapped.__name__ = orig.__name__
+                wrapped.__doc__ = orig.__doc__
+                return wrapped
+            setattr(cls, meth, make())
+
+
 # --- Constants ---
 DAB_SPREADSHEET_ID = 'KRUTART_REDACTED_SHEET_ID_2'
 DAB_GID = '649829434'
 DAB_CSV_URL = f"https://docs.google.com/spreadsheets/d/{DAB_SPREADSHEET_ID}/export?format=csv&gid={DAB_GID}"
 # WebApp URLs - Default fallback values
 DEFAULT_SHOTLIST_URL = "https://script.google.com/macros/s/KRUTART_REDACTED_APPS_SCRIPT_ID_2/exec"
+
+logger = logging.getLogger("KrutartAutoPublisher")
 
 # Global cache for dashboard data
 CACHED_DASH_DATA = {}
@@ -232,9 +371,49 @@ def get_active_phase_for_shot(shot_id):
         return None
     return DAB_TAG_TO_PHASE[highest_tag].lower()
 
+def _is_shot_asset(asset_name):
+    return bool(asset_name and re.search(r"sc\d+-sh\d+", asset_name, re.IGNORECASE))
+
+
+def resolve_publish_phase(context, filepath):
+    """
+    Phase written into a production work-file name (1.9.3). Returns (phase, source, error).
+    Shot files: the dashboard data fetched in this session (file open or the refresh button),
+    so a save never waits on the network; "Manual phase" overrides. No dashboard or no phase in
+    progress -> an error and nothing is saved. Other production files keep the scene's value.
+    """
+    scene = context.scene
+    _, asset, _, _ = parse_filename(filepath)
+    if not _is_shot_asset(asset):
+        return scene.krutart_publish_type, "scene", None
+    if getattr(scene, "krutart_publish_phase_manual", False):
+        logger.warning(f"[Phase] MANUAL phase '{scene.krutart_publish_type}' chosen by the artist for {asset}.")
+        return scene.krutart_publish_type, "manual", None
+    if DASH_FETCH_STATUS != "Synced" or not CACHED_DASH_DATA:
+        return None, None, (f"Phase unknown: the dashboard has not been read in this session "
+                            f"({DASH_FETCH_STATUS}). Click the refresh button next to DAB, or tick 'Manual phase'.")
+    phase = get_active_phase_for_shot(asset)
+    if not phase:
+        return None, None, ("The dashboard shows no phase in progress for this shot. "
+                            "Tick 'Manual phase' to choose one.")
+    for sc in bpy.data.scenes:
+        try:
+            sc.krutart_publish_type = phase
+        except Exception as e:
+            logger.warning(f"Could not set the publish phase '{phase}' on scene '{sc.name}': {e}")
+    return phase, "dab", None
+
+
 @persistent
 def auto_switch_phase_on_load(dummy):
     """Triggered on file load to sync phase with dashboard."""
+    # "Manual phase" never outlives the session it was ticked in (1.9.3).
+    for scene in bpy.data.scenes:
+        try:
+            if getattr(scene, "krutart_publish_phase_manual", False):
+                scene.krutart_publish_phase_manual = False
+        except Exception:
+            pass
     # Run fetch in background thread to avoid UI freeze if we were being fancy,
     # but for now we do a simple sync or rely on manual refresh if needed.
     # Actually, let's just trigger a fetch.
@@ -255,35 +434,50 @@ def auto_switch_phase_on_load(dummy):
 
 # --- Publisher Sheets Logging ---
 
-def _send_publisher_payload_thread(url, payload):
+PUBLISHER_POST_TIMEOUT_S = 30      # the web app regularly needs more than 10 s
+PUBLISHER_POST_RETRY_DELAY_S = 2
+
+
+def _is_timeout_error(exc):
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        return True
+    return "timed out" in str(exc).lower()
+
+
+def _send_publisher_payload_thread(url, payload, timeout=None):
     """
-    Worker function to send data to Google Sheets.
-    Uses standard library urllib for zero-dependency compatibility.
+    Worker thread: POST the publish record. Uses standard library urllib.
+    1.9.3: a timed-out post is NOT retried (the web app normally finishes the write after the
+    client gave up; the old 10 s timeout + retry wrote duplicate rows). A refused or failed
+    post is retried once. Returns 'ok', 'timeout' or 'error: ...'.
     """
+    timeout = PUBLISHER_POST_TIMEOUT_S if timeout is None else timeout
     data = json.dumps(payload).encode('utf-8')
     headers = {
         'Content-Type': 'application/json',
         'User-Agent': 'Blender-KrutartPublisher-Client'
     }
-
-    max_retries = 2
-    base_delay = 1 
-    
-    for attempt in range(1, max_retries + 1):
+    result = "error: not sent"
+    for attempt in (1, 2):
         try:
             req = urllib.request.Request(url, data=data, headers=headers, method='POST')
-            logger.info(f"Uploading to Sheets: {url} (Attempt {attempt}/{max_retries})...")
-            
-            with urllib.request.urlopen(req, timeout=10) as response:
-                result = response.read().decode('utf-8')
-                logger.info(f"Google Sheet Response: {result}")
-                break # Success!
-                
+            logger.info(f"Uploading to Sheets: {url} (attempt {attempt}/2, timeout {timeout} s)...")
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                logger.info(f"Google Sheet Response: {response.read().decode('utf-8')}")
+            return "ok"
         except Exception as e:
+            if _is_timeout_error(e):
+                logger.warning(f"Sheets upload timed out after {timeout} s; not retried "
+                               f"(the web app usually completes the write anyway).")
+                return "timeout"
             logger.error(f"Error during Sheets upload: {e}")
-        
-        if attempt < max_retries:
-            time.sleep(base_delay)
+            result = f"error: {e}"
+            if attempt == 1:
+                time.sleep(PUBLISHER_POST_RETRY_DELAY_S)
+    return result
 
 def upload_publisher_data(context, filepath, comment):
     """
@@ -340,7 +534,7 @@ def parse_filename(filepath):
     Expected format: PROJECT_NAME-ASSET_NAME-v001-optional_comment.blend
     """
     if not filepath:
-        logger.warning("File has not been saved yet. Cannot parse filename.")
+        logger.debug("File has not been saved yet. Cannot parse filename.")
         return None, None, None, None
 
     filename = os.path.basename(filepath)
@@ -353,7 +547,7 @@ def parse_filename(filepath):
     version_match = re.search(r'-v(\d{3,})', name_lower)
     
     if not version_match:
-        logger.warning(f"Filename '{name}' does not contain a version flag like '-v###'.")
+        logger.debug(f"Filename '{name}' does not contain a version flag like '-v###'.")
         return None, None, None, None
 
     # Extract version and the part of the name before it
@@ -458,9 +652,15 @@ class KRUTART_OT_save_increment(bpy.types.Operator):
         new_version = max(version, latest_ver) + 1
         new_version_str = f"v{new_version:03d}"
         
-        # --- NEW LOGIC (v1.8.0): Dynamic publish type for PRODUCTION ---
+        # --- Dynamic publish type for PRODUCTION (v1.8.0; 1.9.3: from the dashboard) ---
         if _is_production(current_filepath):
-            new_version_str += f"-{context.scene.krutart_publish_type}"
+            phase, phase_source, phase_error = resolve_publish_phase(context, current_filepath)
+            if phase_error:
+                self.report({'ERROR'}, phase_error)
+                logger.error(f"Save Increment blocked: {phase_error}")
+                return {'CANCELLED'}
+            field(f"[Phase] Save Increment as '{phase}' (source: {phase_source}) for {os.path.basename(current_filepath)}")
+            new_version_str += f"-{phase}"
         # --- END NEW LOGIC ---
 
         logger.info(f"Incrementing version from v{version:03d} (latest in dir: v{latest_ver:03d}) to {new_version_str}")
@@ -518,6 +718,25 @@ class KRUTART_OT_save_increment(bpy.types.Operator):
 
         return {'FINISHED'}
 
+def _lifeguard_may_write(filepath=None):
+    """
+    The overwrite shield redirects a guest's save to a __CONFLICT file, and a save handler cannot make the
+    calling operator fail - so ask first. Asks Krutart Overwrite Shield directly (the copy that is active,
+    then the module by name), then the retired Lifeguard shim, which forwards to it. (True, "") when none is
+    loaded or the check fails (fail open, as before).
+    """
+    for name in (getattr(sys, "_krutart_overwrite_shield_active", None), "krutart-overwrite_shield", "krutart-lifeguard"):
+        mod = sys.modules.get(name) if name else None
+        check = getattr(mod, "may_write", None)
+        if callable(check):
+            try:
+                return check(filepath)
+            except Exception as e:
+                logger.warning(f"Overwrite shield check failed open ({name}): {e!r}")
+                return True, ""
+    return True, ""
+
+
 class KRUTART_OT_make_hero(bpy.types.Operator):
     """Saves the current file, creates a 'hero' copy, then saves an incremented version of the work file."""
     bl_idname = "krutart.make_hero"
@@ -535,6 +754,12 @@ class KRUTART_OT_make_hero(bpy.types.Operator):
             logger.error("Make Hero failed: File has not been saved yet.")
             return {'CANCELLED'}
 
+        ok, reason = _lifeguard_may_write()
+        if not ok:
+            self.report({'ERROR'}, f"Lifeguard: {reason}")
+            logger.error(f"Blocked by Lifeguard: {reason}")
+            return {'CANCELLED'}
+
         project, asset, flags, version = parse_filename(current_filepath)
         if version is None:
             self.report({'ERROR'}, "Filename format incorrect. Expected 'PROJECT-ASSET-[flags]-v###.blend'")
@@ -548,6 +773,16 @@ class KRUTART_OT_make_hero(bpy.types.Operator):
             logger.error("Make Hero failed: No comment provided.")
             return {'CANCELLED'}
         # --- END MODIFICATION ---
+
+        # 1.9.3: the phase for the incremented work file is settled BEFORE anything is saved.
+        publish_phase = None
+        if _is_production(current_filepath):
+            publish_phase, phase_source, phase_error = resolve_publish_phase(context, current_filepath)
+            if phase_error:
+                self.report({'ERROR'}, phase_error)
+                logger.error(f"Make Hero blocked: {phase_error}")
+                return {'CANCELLED'}
+            field(f"[Phase] Make Hero as '{publish_phase}' (source: {phase_source}) for {os.path.basename(current_filepath)}")
 
         # Define hero_filepath here to make it available for the final report
         hero_filepath = "[not saved]" # Initialize with a default/error string
@@ -755,7 +990,7 @@ class KRUTART_OT_make_hero(bpy.types.Operator):
             
             # --- NEW LOGIC (v1.8.0): Dynamic publish type for PRODUCTION ---
             if _is_production(saved_work_filepath):
-                new_version_str += f"-{context.scene.krutart_publish_type}"
+                new_version_str += f"-{publish_phase or context.scene.krutart_publish_type}"
             # --- END NEW LOGIC ---
 
             logger.info(f"Incrementing work file from v{version:03d} (latest in dir: v{latest_ver:03d}) to {new_version_str}")
@@ -837,6 +1072,12 @@ class KRUTART_OT_send_to_tex_paint(bpy.types.Operator):
     def execute(self, context):
         logger.info("-" * 50)
         logger.info("Starting 'Send to Texture Paint' process...")
+
+        ok, reason = _lifeguard_may_write()
+        if not ok:
+            self.report({'ERROR'}, f"Lifeguard: {reason}")
+            logger.error(f"Blocked by Lifeguard: {reason}")
+            return {'CANCELLED'}
 
         # 1. Save current file
         try:
@@ -1042,12 +1283,22 @@ def draw_publisher_ui(layout, context):
         dash_row.label(text=f"DAB: {DASH_FETCH_STATUS}", icon='URL')
         dash_row.operator("krutart.refresh_dash", icon='FILE_REFRESH', text="")
         
-        # Phase toggle: all six phases in a 2-column x 3-row grid.
+        # Six phases in a 2-column x 3-row grid (1.9.3): for shot files it shows what the
+        # dashboard says and is only editable with "Manual phase".
+        _, _panel_asset, _, _ = parse_filename(get_current_filepath())
+        _is_shot_file = _is_shot_asset(_panel_asset)
         phase_grid = box.column(align=True)
+        phase_grid.enabled = (not _is_shot_file) or bool(scene.krutart_publish_phase_manual)
         for _i in range(0, len(PHASE_ITEMS), 2):
             phase_row = phase_grid.row(align=True)
             for _phase_id, _phase_name, _phase_desc in PHASE_ITEMS[_i:_i + 2]:
                 phase_row.prop_enum(scene, 'krutart_publish_type', _phase_id, text=_phase_name)
+        if _is_shot_file:
+            box.prop(scene, "krutart_publish_phase_manual")
+            if scene.krutart_publish_phase_manual:
+                warn = box.row()
+                warn.alert = True
+                warn.label(text="Manual phase: the dashboard is not checked.", icon='ERROR')
     # --- END NEW LOGIC ---
     
     # Shared comment field at the top
@@ -1197,7 +1448,10 @@ def register():
     logger.addHandler(handler)
     # --- End Logger Setup ---
 
-    logger.info("Registering Krutart Publisher Addon v1.8.9")
+    logger.info("Registering Krutart Publisher Addon v%d.%d.%d" % bl_info["version"])
+    _field_log_attach(bl_info["version"])
+    _field_wrap_operators(classes)
+    field("session start: Publisher %d.%d.%d registered" % bl_info["version"])
     for cls in classes:
         bpy.utils.register_class(cls)
     
@@ -1217,7 +1471,13 @@ def register():
     bpy.types.Scene.krutart_publish_type = bpy.props.EnumProperty(
         name="Phase",
         items=get_publish_type_items,
-        description="Select the production phase for this publish",
+        description="Production phase written into the work-file name, taken from the dashboard for shots",
+    )
+    bpy.types.Scene.krutart_publish_phase_manual = bpy.props.BoolProperty(
+        name="Manual phase",
+        description=("Choose the phase by hand instead of from the dashboard. Only for deliberate "
+                     "exceptions; it resets when a file is opened"),
+        default=False,
     )
 
 def unregister():
@@ -1226,7 +1486,7 @@ def unregister():
     logger.info("Unregistering Krutart Publisher Addon")
 
     # --- Logger Teardown ---
-    # Get the logger and clear its handlers
+    # Get the logger and clear its handlers (the field-log handler goes with them)
     if 'logger' in globals() and logger and logger.hasHandlers():
         logger.handlers.clear()
     # --- End Logger Teardown ---
@@ -1235,6 +1495,7 @@ def unregister():
         bpy.utils.unregister_class(cls) 
     del bpy.types.Scene.krutart_comment
     del bpy.types.Scene.krutart_publish_type
+    del bpy.types.Scene.krutart_publish_phase_manual
 
 if __name__ == "__main__":
     register()
